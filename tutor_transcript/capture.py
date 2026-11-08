@@ -1,22 +1,21 @@
-"""Захват звука: источники (loopback + микрофон), смешивание и управление записью.
+"""Запись системного звука вместе с микрофоном.
 
-Схема работы
-------------
+Как это работает
+----------------
 
-1. Для каждого источника запускается отдельный поток.
-2. Поток читает звук блоками фиксированной длины (по умолчанию 0,2 с) и кладёт
-   блок в общий :class:`BlockBuffer`.
-3. Как только все источники отдали блок, буфер отдаёт «полный» блок, который
-   сразу пишется в WAV-файл как сумма каналов (микрофон + звук компьютера).
+1. Открываются два источника: loopback-копия динамиков (звук компьютера —
+   собеседник в Zoom/Телемосте) и микрофон. Оба — через ``soundcard``, который
+   работает поверх WASAPI и не требует виртуальных аудиокабелей.
+2. Каждый источник читается в своём потоке блоками по 0,2 с.
+3. Блоки синхронизируются по счётчику и складываются в одну дорожку, которая
+   сразу пишется в WAV 16 кГц моно.
 
-Устройства по умолчанию имеют независимые часы, поэтому блоки синхронизируются
-по счётчику: если один источник отстал, его данные дополняются тишиной —
-рассинхронизация не накапливается (это критично для занятий длиной в час и
-больше).
+Если один из источников недоступен (занят, отключён, драйвер не отдаёт
+loopback), запись продолжается с оставшимся и об этом появляется предупреждение
+в журнале — занятие не прерывается.
 
-Если ``soundcard`` не может открыть loopback-устройство, системный звук
-автоматически переключается на запасной путь — WASAPI loopback через
-``sounddevice`` (:class:`SoundDeviceLoopbackSource`).
+Пауза не закрывает устройства: звук продолжает читаться, но не пишется в файл.
+Поэтому после «Продолжить» в записи нет щелчков и провалов.
 """
 
 from __future__ import annotations
@@ -31,20 +30,20 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .audio_sink import WavWriter, read_wav_mono, resample_linear
-from .config import SAMPLE_RATE, Config, app_data_dir
-from .devices import DeviceInfo, LOOPBACK, MIC, pick_default
+from .config import SAMPLE_RATE, STOP_TIMEOUT, temp_dir
+from .devices import LOOPBACK, MIC, choose_sources
 
 log = logging.getLogger(__name__)
 
-#: Длительность одного блока в секундах (определяет «зерно» синхронизации).
+#: Длительность одного блока в секундах — «зерно» синхронизации источников.
 BLOCK_SECONDS = 0.2
 
-#: Сколько блоков максимум держим в запасе (страховка от утечки памяти).
+#: Верхний предел блоков в буфере (страховка от переполнения памяти).
 MAX_PENDING_BLOCKS = 50
 
 
@@ -58,9 +57,8 @@ class CaptureError(RuntimeError):
 def com_init() -> None:
     """Инициализирует COM в текущем потоке (нужно перед работой со soundcard).
 
-    Библиотека ``soundcard`` инициализирует COM только в том потоке, где её
-    импортировали. Мы читаем звук в отдельных потоках, поэтому там нужно
-    вызвать ``CoInitializeEx`` ещё раз. Повторный вызов безопасен.
+    ``soundcard`` инициализирует COM только в том потоке, где его импортировали,
+    а мы читаем звук в отдельных потоках. Повторный вызов безопасен.
     """
     if sys.platform != "win32":
         return
@@ -70,7 +68,7 @@ def com_init() -> None:
         COINIT_MULTITHREADED = 0x0
         RPC_E_CHANGED_MODE = -2147417850  # 0x80010106 — COM уже инициализирован
         hr = ctypes.windll.ole32.CoInitializeEx(None, COINIT_MULTITHREADED)
-        if hr not in (0, 1, RPC_E_CHANGED_MODE):  # S_OK, S_FALSE, смена модели
+        if hr not in (0, 1, RPC_E_CHANGED_MODE):
             log.debug("CoInitializeEx вернул 0x%08X", hr & 0xFFFFFFFF)
     except Exception as exc:  # noqa: BLE001 - не критично
         log.debug("Не удалось инициализировать COM: %s", exc)
@@ -80,12 +78,12 @@ def com_init() -> None:
 #  Буфер блоков и смешивание
 # --------------------------------------------------------------------------- #
 class BlockBuffer:
-    """Собирает блоки от нескольких источников и отдаёт их «полными».
+    """Собирает блоки от двух источников и отдаёт их «полными».
 
-    Потокобезопасен: ``push`` вызывают потоки-источники, ``take`` — поток записи.
+    ``push`` вызывают потоки-источники, поэтому доступ синхронизирован.
     """
 
-    def __init__(self, keys: Iterable[str], blocksize: int,
+    def __init__(self, keys: Tuple[str, ...], blocksize: int,
                  max_pending: int = MAX_PENDING_BLOCKS) -> None:
         self.keys = tuple(keys)
         self.blocksize = int(blocksize)
@@ -95,17 +93,17 @@ class BlockBuffer:
         self.dropped_blocks = 0
 
     def push(self, key: str, samples: np.ndarray) -> Optional[Dict[str, np.ndarray]]:
-        """Добавляет блок источника; возвращает готовый набор блоков или None."""
+        """Добавляет блок; возвращает набор блоков, когда готовы все источники."""
         block = self._fit(samples)
         with self._lock:
-            if key not in self._pending or not self.keys:
-                return None  # источник отключился/уже не нужен
-            per_key = self._pending[key]
-            per_key.append(block)
-            if len(per_key) > self.max_pending:
-                # Потребитель не успевает: выбрасываем самый старый блок,
-                # чтобы не съесть память на многочасовой лекции.
-                per_key.pop(0)
+            if key not in self._pending:
+                return None  # источник отключился
+            pending = self._pending[key]
+            pending.append(block)
+            if len(pending) > self.max_pending:
+                # потребитель не успевает — выбрасываем самый старый блок,
+                # чтобы многочасовое занятие не съело память
+                pending.pop(0)
                 self.dropped_blocks += 1
             if not all(self._pending[k] for k in self.keys):
                 return None
@@ -122,46 +120,32 @@ class BlockBuffer:
             [data, np.zeros(self.blocksize - data.size, dtype=np.float32)]
         )
 
-    def pop_all(self) -> List[Dict[str, Optional[np.ndarray]]]:
-        """Забирает все накопленные блоки (для финального «дописывания»)."""
+    def set_keys(self, keys: Tuple[str, ...]) -> None:
+        """Меняет набор источников (если один из них отказал)."""
         with self._lock:
-            sets: List[Dict[str, Optional[np.ndarray]]] = []
+            self._pending = {k: self._pending.get(k, []) for k in keys}
+            self.keys = tuple(keys)
+
+    def pop_all(self) -> List[Dict[str, Optional[np.ndarray]]]:
+        """Забирает все накопленные блоки (для финального дописывания)."""
+        with self._lock:
+            groups: List[Dict[str, Optional[np.ndarray]]] = []
             while any(self._pending[k] for k in self.keys):
-                sets.append({
+                groups.append({
                     k: (self._pending[k].pop(0) if self._pending[k] else None)
                     for k in self.keys
                 })
-            return sets
-
-    def set_keys(self, keys: Iterable[str]) -> None:
-        """Меняет набор активных источников (например, если один отвалился).
-
-        Данные отключённого источника выбрасываются, а оставшиеся перестают
-        ждать «пару» — иначе запись встала бы и в файл попало бы 0,2 секунды
-        звука вместо всего занятия.
-        """
-        new_keys = tuple(keys)
-        with self._lock:
-            self._pending = {k: self._pending.get(k, []) for k in new_keys}
-            self.keys = new_keys
+            return groups
 
     def reset(self) -> None:
         with self._lock:
             for key in self.keys:
                 self._pending[key].clear()
 
-    def pending_counts(self) -> Dict[str, int]:
-        with self._lock:
-            return {k: len(v) for k, v in self._pending.items()}
-
 
 def mix_channels(parts: Dict[str, Optional[np.ndarray]],
                  blocksize: int) -> np.ndarray:
-    """Складывает каналы в одну дорожку без клиппинга.
-
-    Если каналов два, каждый предварительно ослабляется, чтобы перегрузка
-    случалась реже; итог ограничивается диапазоном [-1, 1].
-    """
+    """Складывает микрофон и системный звук в одну дорожку без клиппинга."""
     present = [p for p in parts.values() if p is not None]
     mixed = np.zeros(blocksize, dtype=np.float32)
     for data in present:
@@ -172,34 +156,38 @@ def mix_channels(parts: Dict[str, Optional[np.ndarray]],
             )
         mixed += chunk[:blocksize]
     if len(present) > 1:
-        mixed *= 0.75
+        mixed *= 0.75  # два источника: ослабляем, чтобы не было перегрузки
     return np.clip(mixed, -1.0, 1.0)
 
 
 class Levels:
-    """Индикаторы уровня сигнала (потокобезопасно)."""
+    """Уровни сигнала: используются только для предупреждения «звука нет».
+
+    В интерфейсе индикаторов нет (они не нужны), но если через 10 секунд
+    после старта ни микрофон, ни звук компьютера не дают сигнала — программа
+    подскажет, что запись, скорее всего, пустая.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._values: Dict[str, float] = {"mic": 0.0, "system": 0.0, "mix": 0.0}
+        self._peaks: Dict[str, float] = {MIC: 0.0, LOOPBACK: 0.0, "mix": 0.0}
 
     def update(self, key: str, samples: Optional[np.ndarray]) -> None:
         if samples is None or samples.size == 0:
             return
         peak = float(np.max(np.abs(samples)))
         with self._lock:
-            previous = self._values.get(key, 0.0)
-            # сглаживание, чтобы полоска не «дёргалась»
-            self._values[key] = peak if peak > previous else previous * 0.6
+            previous = self._peaks.get(key, 0.0)
+            self._peaks[key] = peak if peak > previous else previous * 0.6
 
     def get(self, key: str) -> float:
         with self._lock:
-            return min(1.0, self._values.get(key, 0.0))
+            return min(1.0, self._peaks.get(key, 0.0))
 
     def reset(self) -> None:
         with self._lock:
-            for key in self._values:
-                self._values[key] = 0.0
+            for key in self._peaks:
+                self._peaks[key] = 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -222,17 +210,13 @@ class AudioSource:
 
 
 class SoundCardSource(AudioSource):
-    """Источник на библиотеке soundcard (MediaFoundation / WASAPI).
+    """Источник на ``soundcard`` (WASAPI): микрофон или loopback динамиков.
 
-    Работает и для микрофона, и для loopback-копии динамиков.
-
-    Частота: WASAPI обычно соглашается на 16 кГц (драйвер сам пересчитывает),
-    но некоторые устройства (Bluetooth-гарнитуры, старые USB-микрофоны)
-    принимают только «родную» частоту. Поэтому открываем первую подходящую
-    из списка и, если частота отличается, пересчитываем сами.
+    WASAPI обычно соглашается на 16 кГц, но некоторые устройства (Bluetooth-
+    гарнитуры, старые USB-микрофоны) принимают только свою частоту. На этот
+    случай пробуем 48 и 44,1 кГц и пересчитываем сами.
     """
 
-    #: Частоты, которые пробуем по очереди.
     FALLBACK_RATES = (48_000, 44_100)
 
     def __init__(self, key: str, mic_factory: Callable[[], object],
@@ -240,10 +224,9 @@ class SoundCardSource(AudioSource):
         self.key = key
         self.description = description
         self._mic_factory = mic_factory
-        self.samplerate = int(samplerate)   # частота записи (16 кГц)
-        self.device_rate = self.samplerate  # частота устройства
+        self.samplerate = int(samplerate)    # частота, в которой пишем (16 кГц)
+        self.device_rate = self.samplerate   # частота, которую отдаёт устройство
         self._recorder = None
-        self._mic = None
         self._leftover = np.zeros(0, dtype=np.float32)
 
     def open(self) -> None:
@@ -257,16 +240,11 @@ class SoundCardSource(AudioSource):
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{rate} Гц: {exc}")
                 continue
-            self._mic = mic
             self._recorder = recorder
             self.device_rate = rate
             if rate != self.samplerate:
-                log.info(
-                    "Устройство «%s» не отдаёт %s Гц — пишем в %s Гц и "
-                    "пересчитываем сами", self.description, self.samplerate, rate,
-                )
-            log.info("Открыт источник %s: %s (%s Гц)",
-                     self.key, self.description, rate)
+                log.info("«%s» не отдаёт %s Гц — пишем в %s Гц с пересчётом",
+                         self.description, self.samplerate, rate)
             return
         raise CaptureError(
             f"не удалось открыть «{self.description or self.key}»: "
@@ -276,10 +254,9 @@ class SoundCardSource(AudioSource):
     def read(self, numframes: int) -> np.ndarray:
         if self._recorder is None:
             raise CaptureError(f"источник {self.key} не открыт")
+
         device_frames = numframes
         if self.device_rate != self.samplerate:
-            # просим у устройства столько отсчётов, сколько нужно для
-            # numframes на частоте записи
             device_frames = max(
                 1, int(round(numframes * self.device_rate / self.samplerate))
             )
@@ -289,6 +266,7 @@ class SoundCardSource(AudioSource):
             raise CaptureError(
                 f"сбой чтения «{self.description or self.key}»: {exc}"
             ) from exc
+
         block = np.asarray(data, dtype=np.float32)
         if block.ndim > 1:
             block = block.mean(axis=1)
@@ -297,7 +275,7 @@ class SoundCardSource(AudioSource):
         if self.device_rate == self.samplerate:
             return block
 
-        # пересчёт частоты: склеиваем с остатком и берём ровно numframes
+        # пересчёт частоты: склеиваем с остатком и отдаём ровно numframes
         buffer = np.concatenate([self._leftover, block]) if self._leftover.size else block
         converted = resample_linear(buffer, self.device_rate, self.samplerate)
         if converted.size >= numframes:
@@ -318,7 +296,7 @@ class SoundCardSource(AudioSource):
 
 
 class SilentSource(AudioSource):
-    """Заглушка: отдаёт тишину в реальном времени (если устройство не найдено)."""
+    """Заглушка: отдаёт тишину в реальном времени (устройства нет)."""
 
     def __init__(self, key: str, samplerate: int,
                  description: str = "тишина (устройство не найдено)") -> None:
@@ -346,13 +324,13 @@ class SilentSource(AudioSource):
 class FallbackSource(AudioSource):
     """Источник с автоматическим переходом на запасной путь.
 
-    Сначала пробуем основной способ (soundcard). Если он не открылся или
-    сломался во время записи — переключаемся на запасной (sounddevice/WASAPI),
-    не прерывая занятие.
+    Используется для системного звука: сначала ``soundcard`` (WASAPI loopback),
+    а если он не смог открыть устройство — ``sounddevice`` с WASAPI loopback.
+    Переключение происходит без прерывания записи.
     """
 
     def __init__(self, key: str, primary_factory: Callable[[], AudioSource],
-                 fallback_factory: Optional[Callable[[], AudioSource]],
+                 fallback_factory: Optional[Callable[[], AudioSource]] = None,
                  on_fallback: Optional[Callable[[str], None]] = None) -> None:
         self.key = key
         self.description = ""
@@ -384,10 +362,8 @@ class FallbackSource(AudioSource):
         self._using_fallback = True
         self.description = source.description
         message = (
-            f"Системный звук пишется резервным способом ({source.description}). "
+            f"звук компьютера пишется резервным способом ({source.description}). "
             f"Причина: {reason}"
-            if self.key == LOOPBACK
-            else f"Источник переключён на резервный: {source.description} ({reason})"
         )
         log.warning(message)
         if self._on_fallback is not None:
@@ -429,11 +405,10 @@ class FallbackSource(AudioSource):
 
 
 class SoundDeviceLoopbackSource(AudioSource):
-    """Запасной путь для системного звука: sounddevice + WASAPI loopback.
+    """Резервный захват системного звука: ``sounddevice`` + WASAPI loopback.
 
-    Используется, если soundcard не смог открыть loopback-устройство.
-    Требует, чтобы PortAudio в установленной сборке поддерживал loopback
-    (в официальных колёсах sounddevice для Windows это так).
+    Нужен, если драйвер не даёт звук через ``soundcard``. PortAudio отдаёт
+    обычно 48 кГц, поэтому здесь же выполняется пересчёт в 16 кГц.
     """
 
     key = LOOPBACK
@@ -446,15 +421,13 @@ class SoundDeviceLoopbackSource(AudioSource):
         self._queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=200)
         self._buffer = np.zeros(0, dtype=np.float32)
         self._device_rate = self.samplerate
-        self._leftover = np.zeros(0, dtype=np.float32)
 
-    # ------------------------------------------------------------------ #
     @staticmethod
     def _normalize(name: str) -> str:
         return re.sub(r"[\s()\[\]\-_,.]", "", name.lower())
 
     def _find_portaudio_device(self) -> Tuple[int, dict]:
-        """Ищет WASAPI-устройство, из которого можно читать системный звук."""
+        """Ищет WASAPI-устройство, из которого читается системный звук."""
         import sounddevice as sd
 
         devices = list(sd.query_devices())
@@ -468,23 +441,22 @@ class SoundDeviceLoopbackSource(AudioSource):
             if wasapi and info["hostapi"] not in wasapi:
                 continue
             name = str(info["name"])
-            # Порто-аудио-сборка PortAudio с loopback: у динамиков появляется
-            # одноимённое входное устройство с пометкой [Loopback].
             if info["max_input_channels"] > 0 and "loopback" in name.lower():
                 candidates.append((index, info))
 
         if not candidates:
             raise CaptureError(
                 "запасной способ недоступен: sounddevice не нашёл устройств "
-                "WASAPI loopback (нужна сборка sounddevice с поддержкой loopback)"
+                "WASAPI loopback"
             )
 
         if self.target_name:
             wanted = self._normalize(self.target_name)
             scored = []
             for index, info in candidates:
-                candidate = self._normalize(str(info["name"]))
-                ratio = difflib.SequenceMatcher(None, wanted, candidate).ratio()
+                ratio = difflib.SequenceMatcher(
+                    None, wanted, self._normalize(str(info["name"]))
+                ).ratio()
                 scored.append((ratio, index, info))
             scored.sort(key=lambda item: item[0], reverse=True)
             if scored[0][0] > 0.3:
@@ -520,10 +492,7 @@ class SoundDeviceLoopbackSource(AudioSource):
             callback=_callback,
         )
         self._stream.start()
-        self.description = (
-            f"WASAPI loopback: {info['name']} ({self._device_rate} Гц)"
-        )
-        log.info("Открыт запасной источник системного звука: %s", self.description)
+        self.description = f"WASAPI loopback: {info['name']} ({self._device_rate} Гц)"
 
     def read(self, numframes: int) -> np.ndarray:
         deadline = time.monotonic() + 5.0
@@ -534,19 +503,11 @@ class SoundDeviceLoopbackSource(AudioSource):
             try:
                 chunk = self._queue.get(timeout=timeout)
             except queue.Empty:
-                if time.monotonic() > deadline:
-                    # тишина в системе: отдаём нули, запись продолжается
-                    timeout_zero = np.zeros(numframes, dtype=np.float32)
-                    if self._device_rate != self.samplerate:
-                        zero_count = int(round(
-                            numframes * self._device_rate / self.samplerate
-                        ))
-                        timeout_zero = np.zeros(zero_count, dtype=np.float32)
-                        return resample_linear(
-                            timeout_zero, self._device_rate, self.samplerate
-                        )[:numframes]
-                    return timeout_zero
-                continue
+                if time.monotonic() <= deadline:
+                    continue
+                # в системе тишина: отдаём нули, запись продолжается
+                zeros = np.zeros(numframes, dtype=np.float32)
+                return zeros
             self._buffer = np.concatenate([self._buffer, chunk])
 
         take, self._buffer = self._buffer, np.zeros(0, dtype=np.float32)
@@ -576,17 +537,13 @@ class SourceThread(threading.Thread):
 
     def __init__(self, source: AudioSource, blocksize: int,
                  on_block: Callable[[str, np.ndarray], None],
-                 on_error: Callable[[str, str], None],
-                 on_log: Optional[Callable[[str], None]] = None) -> None:
+                 on_error: Callable[[str, str], None]) -> None:
         super().__init__(name=f"capture-{source.key}", daemon=True)
         self.source = source
         self.blocksize = blocksize
         self._on_block = on_block
         self._on_error = on_error
-        self._on_log = on_log
         self._stop_event = threading.Event()
-        self.blocks_read = 0
-        self.error: Optional[str] = None
         self.open_error: Optional[str] = None
 
     def stop(self) -> None:
@@ -599,22 +556,15 @@ class SourceThread(threading.Thread):
         except Exception as exc:  # noqa: BLE001
             self.open_error = str(exc)
             self._on_error(self.source.key, str(exc))
-            log.error("Источник %s не открылся: %s", self.source.key, exc)
             return
-
-        if self._on_log is not None and self.source.description:
-            self._on_log(f"{self.source.key}: {self.source.description}")
 
         try:
             while not self._stop_event.is_set():
                 try:
                     block = self.source.read(self.blocksize)
                 except Exception as exc:  # noqa: BLE001
-                    self.error = str(exc)
                     self._on_error(self.source.key, str(exc))
-                    log.error("Ошибка чтения %s: %s", self.source.key, exc)
                     break
-                self.blocks_read += 1
                 self._on_block(self.source.key, block)
         finally:
             try:
@@ -628,7 +578,7 @@ class SourceThread(threading.Thread):
 # --------------------------------------------------------------------------- #
 @dataclass
 class RecordingResult:
-    """Итог записи: файл, длительность и предупреждения."""
+    """Итог записи."""
 
     wav_path: Path
     duration: float
@@ -636,37 +586,29 @@ class RecordingResult:
     stopped_at: datetime
     sources: Dict[str, str] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
-    #: True — файл выбран пользователем (его нельзя удалять/перезаписывать).
-    external: bool = False
-
-    @property
-    def empty(self) -> bool:
-        return self.duration < 1.0
 
 
 # --------------------------------------------------------------------------- #
 #  Контроллер записи
 # --------------------------------------------------------------------------- #
 class RecordingController:
-    """Управляет записью: старт → пауза/продолжение → стоп.
+    """Запись «системный звук + микрофон»: старт, пауза, стоп.
 
     Пример::
 
-        controller = RecordingController(config)
+        controller = RecordingController(on_log=print)
         controller.start()
         ...
         result = controller.stop()
     """
 
-    def __init__(self, config: Config, levels: Optional[Levels] = None,
-                 on_log: Optional[Callable[[str], None]] = None) -> None:
-        self.config = config
-        self.levels = levels or Levels()
+    def __init__(self, on_log: Optional[Callable[[str], None]] = None) -> None:
+        self.levels = Levels()
         self._on_log = on_log
 
         self.samplerate = SAMPLE_RATE
         self.blocksize = int(round(BLOCK_SECONDS * SAMPLE_RATE))
-        self.buffer = BlockBuffer([], self.blocksize)
+        self.buffer = BlockBuffer((), self.blocksize)
 
         self._writer: Optional[WavWriter] = None
         self._threads: List[SourceThread] = []
@@ -678,12 +620,9 @@ class RecordingController:
         self._recording = False
         self._sink_error: Optional[str] = None
         self._source_errors: List[str] = []
-        self._dropped_blocks = 0
         self._overall_peak = 0.0
         self.wav_path: Optional[Path] = None
 
-    # ------------------------------------------------------------------ #
-    #  Свойства состояния
     # ------------------------------------------------------------------ #
     @property
     def is_recording(self) -> bool:
@@ -700,108 +639,82 @@ class RecordingController:
         return writer.duration if writer is not None else 0.0
 
     @property
-    def source_errors(self) -> List[str]:
-        return list(self._source_errors)
+    def source_keys(self) -> Tuple[str, ...]:
+        return tuple(self.buffer.keys)
 
     @property
     def warnings(self) -> List[str]:
         return list(self._warnings)
 
     @property
-    def source_keys(self) -> Tuple[str, ...]:
-        """Ключи активных источников (mic / loopback)."""
-        return tuple(self.buffer.keys)
+    def is_too_quiet(self) -> bool:
+        """Похоже, что за всё занятие не пришло ни одного громкого звука."""
+        return self._overall_peak < 0.002
 
     # ------------------------------------------------------------------ #
-    #  Сборка источников
-    # ------------------------------------------------------------------ #
-    def _build_sources(
-        self, devices: List[DeviceInfo], mode: str
-    ) -> Tuple[List[AudioSource], List[str], Dict[str, str]]:
-        """Создаёт источники согласно режиму записи."""
+    def _build_sources(self) -> Tuple[List[AudioSource], List[str], Dict[str, str]]:
+        """Открывает оба источника: системный звук и микрофон."""
         warnings: List[str] = []
         info: Dict[str, str] = {}
         sources: List[AudioSource] = []
 
-        need_system = mode in ("both", "system")
-        need_mic = mode in ("both", "mic")
+        system, mic = choose_sources()
+        speaker_name = system.name if system else ""
 
-        system_device = pick_default(devices, LOOPBACK, self.config.system_device)
-        mic_device = pick_default(devices, MIC, self.config.mic_device)
-
-        # --- системный звук ------------------------------------------------
-        if need_system:
-            speaker_name = system_device.name if system_device else ""
-
-            def _primary() -> AudioSource:
-                return SoundCardSource(
-                    LOOPBACK,
-                    mic_factory=lambda: _soundcard_loopback(speaker_name),
-                    samplerate=self.samplerate,
-                    description=speaker_name or "динамики по умолчанию",
-                )
-
-            fallback_factory: Optional[Callable[[], AudioSource]] = None
-            if self.config.allow_sounddevice_fallback:
-                try:
-                    import sounddevice  # noqa: F401
-
-                    fallback_factory = lambda: SoundDeviceLoopbackSource(  # noqa: E731
-                        speaker_name, self.samplerate
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    warnings.append(
-                        "sounddevice не установлен — резервный захват системного "
-                        f"звука недоступен ({exc})."
-                    )
-
-            sources.append(
-                FallbackSource(
-                    LOOPBACK,
-                    primary_factory=_primary,
-                    fallback_factory=fallback_factory,
-                    on_fallback=self._on_runtime_warning,
-                )
+        # --- системный звук (loopback динамиков) ---------------------------
+        def _primary() -> AudioSource:
+            return SoundCardSource(
+                LOOPBACK,
+                mic_factory=lambda: _soundcard_loopback(speaker_name),
+                samplerate=self.samplerate,
+                description=speaker_name or "динамики по умолчанию",
             )
-            info[LOOPBACK] = speaker_name or "динамики по умолчанию"
-            if system_device is None:
-                warnings.append(
-                    "Loopback-устройство не найдено: попробуем резервный способ. "
-                    "Если звука компьютера нет, запустите воспроизведение "
-                    "(видео/звонок) и нажмите «Обновить устройства»."
-                )
+
+        fallback_factory: Optional[Callable[[], AudioSource]] = None
+        try:
+            import sounddevice  # noqa: F401
+
+            fallback_factory = lambda: SoundDeviceLoopbackSource(  # noqa: E731
+                speaker_name, self.samplerate
+            )
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(
+                f"sounddevice не установлен — резервный захват системного звука "
+                f"недоступен ({exc})."
+            )
+
+        sources.append(FallbackSource(
+            LOOPBACK,
+            primary_factory=_primary,
+            fallback_factory=fallback_factory,
+            on_fallback=self._on_runtime_warning,
+        ))
+        info[LOOPBACK] = speaker_name or "динамики по умолчанию"
+        if system is None:
+            warnings.append(
+                "loopback-устройство не найдено: если звука компьютера не будет "
+                "в записи, включите любое воспроизведение и запустите запись снова."
+            )
 
         # --- микрофон ------------------------------------------------------
-        if need_mic:
-            if mic_device is not None:
-                mic_name = mic_device.name
-                sources.append(
-                    SoundCardSource(
-                        MIC,
-                        mic_factory=lambda: _soundcard_microphone(mic_name),
-                        samplerate=self.samplerate,
-                        description=mic_name,
-                    )
-                )
-                info[MIC] = mic_name
-            else:
-                warnings.append(
-                    "Микрофон не найден. Запись будет идти без вашего голоса — "
-                    "проверьте, что микрофон подключён, и обновите устройства."
-                )
-                sources.append(
-                    SilentSource(MIC, self.samplerate, "микрофон не найден")
-                )
-                info[MIC] = "—"
-
-        if not sources:
-            warnings.append("Не выбрано ни одного источника звука.")
-            sources.append(SilentSource(MIC, self.samplerate, "нет источников"))
+        if mic is not None:
+            mic_name = mic.name
+            sources.append(SoundCardSource(
+                MIC,
+                mic_factory=lambda: _soundcard_microphone(mic_name),
+                samplerate=self.samplerate,
+                description=mic_name,
+            ))
+            info[MIC] = mic_name
+        else:
+            warnings.append(
+                "микрофон не найден: запись пойдёт без вашего голоса."
+            )
+            sources.append(SilentSource(MIC, self.samplerate, "микрофон не найден"))
+            info[MIC] = "—"
 
         return sources, warnings, info
 
-    # ------------------------------------------------------------------ #
-    #  Старт / пауза / стоп
     # ------------------------------------------------------------------ #
     def start(self, output_wav: Optional[Path] = None) -> Path:
         """Начинает запись. Возвращает путь к временному WAV-файлу."""
@@ -809,36 +722,26 @@ class RecordingController:
             if self._recording:
                 raise RuntimeError("Запись уже идёт")
 
-            from .devices import list_devices
-
-            devices = list_devices()
-            mode = self.config.capture_mode
-            sources, warnings, info = self._build_sources(devices, mode)
+            sources, warnings, info = self._build_sources()
             self._warnings = list(warnings)
             self._sources_info = info
             self._source_errors = []
 
             if output_wav is None:
                 stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                output_wav = app_data_dir() / "temp" / f"recording_{stamp}.wav"
+                output_wav = temp_dir() / f"recording_{stamp}.wav"
             self.wav_path = Path(output_wav)
-            self.wav_path.parent.mkdir(parents=True, exist_ok=True)
 
-            self.buffer = BlockBuffer([s.key for s in sources], self.blocksize)
+            self.buffer = BlockBuffer(tuple(s.key for s in sources), self.blocksize)
             self.levels.reset()
             self._paused.clear()
             self._sink_error = None
-            self._dropped_blocks = 0
             self._overall_peak = 0.0
             self._writer = WavWriter(self.wav_path, self.samplerate)
             self._threads = [
-                SourceThread(
-                    source,
-                    self.blocksize,
-                    on_block=self._on_block,
-                    on_error=self._on_source_error,
-                    on_log=self._log,
-                )
+                SourceThread(source, self.blocksize,
+                             on_block=self._on_block,
+                             on_error=self._on_source_error)
                 for source in sources
             ]
             self._started_at = datetime.now()
@@ -846,20 +749,18 @@ class RecordingController:
             for thread in self._threads:
                 thread.start()
 
-            self._log(
-                "Запись началась. Источники: "
-                + "; ".join(f"{k}: {v}" for k, v in info.items())
-            )
+            self._log("Запись началась: "
+                      + ", ".join(f"{k}: {v}" for k, v in info.items()))
             for warning in warnings:
                 self._log("Внимание: " + warning)
             return self.wav_path
 
     def pause(self) -> None:
-        """Приостанавливает запись (звук читается, но в файл не пишется)."""
+        """Приостанавливает запись: звук читается, но в файл не попадает."""
         if not self._recording:
             return
         self._paused.set()
-        self._log("Запись на паузе.")
+        self._log("Пауза.")
 
     def resume(self) -> None:
         """Продолжает запись после паузы."""
@@ -870,7 +771,7 @@ class RecordingController:
         self._log("Запись продолжена.")
 
     def toggle_pause(self) -> bool:
-        """Переключает паузу. Возвращает True, если запись сейчас на паузе."""
+        """Переключает паузу; возвращает True, если сейчас пауза."""
         if self.is_paused:
             self.resume()
         else:
@@ -888,9 +789,8 @@ class RecordingController:
             for thread in self._threads:
                 thread.stop()
             for thread in self._threads:
-                thread.join(timeout=5.0)
+                thread.join(timeout=STOP_TIMEOUT)
 
-            # забираем остатки из буфера, чтобы не потерять последние 0,2 с
             self._flush_pending()
 
             writer, self._writer = self._writer, None
@@ -902,13 +802,12 @@ class RecordingController:
                 warnings.append(self._sink_error)
             if self.buffer.dropped_blocks:
                 warnings.append(
-                    "Часть звука не успела записаться (компьютер был перегружен). "
-                    "Попробуйте закрыть лишние программы."
+                    "часть звука не успела записаться (компьютер был перегружен)."
                 )
-            if self.is_too_quiet():
+            if self.is_too_quiet:
                 warnings.append(
-                    "Похоже, звук почти не поступал (уровень очень низкий). "
-                    "Проверьте, что микрофон и звук компьютера слышны."
+                    "уровень звука в записи очень низкий — проверьте микрофон "
+                    "и громкость системного звука."
                 )
 
             duration = 0.0
@@ -928,22 +827,15 @@ class RecordingController:
                 warnings=warnings,
             )
             self._threads = []
-            self._log(f"Запись остановлена. Длительность: {format_hms(duration)}")
+            self._log(f"Запись остановлена: {format_hms(duration)} звука.")
             return result
 
-    # ------------------------------------------------------------------ #
-    def is_too_quiet(self) -> bool:
-        """Проверяет, был ли записанный звук подозрительно тихим."""
-        return self._overall_peak < 0.002
-
-    # ------------------------------------------------------------------ #
-    #  Внутреннее
     # ------------------------------------------------------------------ #
     def _on_block(self, key: str, block: np.ndarray) -> None:
         """Колбэк потока-источника: складываем блок в буфер."""
         self.levels.update(key, block)
         if self._paused.is_set():
-            return  # на паузе данные читаются, но не пишутся
+            return  # на паузе звук читается, но не пишется
         ready = self.buffer.push(key, block)
         if ready is not None:
             self._write_ready(ready)
@@ -955,10 +847,9 @@ class RecordingController:
         try:
             if len(ready) == 1:
                 mixed = next(iter(ready.values()))
-                self.levels.update("mix", mixed)
             else:
                 mixed = mix_channels(ready, self.blocksize)
-                self.levels.update("mix", mixed)
+            self.levels.update("mix", mixed)
             peak = float(np.max(np.abs(mixed))) if mixed.size else 0.0
             if peak > self._overall_peak:
                 self._overall_peak = peak
@@ -985,18 +876,18 @@ class RecordingController:
             self._source_errors.append(message)
         self._log("Ошибка: " + message)
 
-        remaining = [k for k in self.buffer.keys if k != key]
-        if remaining and key in self.buffer.keys:
+        remaining = tuple(k for k in self.buffer.keys if k != key)
+        if key in self.buffer.keys and remaining:
             self.buffer.set_keys(remaining)
-            labels = {MIC: "микрофон", LOOPBACK: "системный звук"}
+            labels = {MIC: "микрофон", LOOPBACK: "звук компьютера"}
             self._on_runtime_warning(
-                f"Источник «{labels.get(key, key)}» отключился — "
-                "запись продолжается с остальными."
+                f"источник «{labels.get(key, key)}» отключился — "
+                f"запись продолжается с оставшимся."
             )
         elif not remaining:
             self._log(
-                "Больше не осталось работающих источников: запись остановится "
-                "пустой. Проверьте устройства и попробуйте снова."
+                "Работающих источников не осталось. Проверьте устройства "
+                "и запустите запись снова."
             )
 
     def _on_runtime_warning(self, message: str) -> None:
@@ -1017,7 +908,7 @@ class RecordingController:
 #  Помощники
 # --------------------------------------------------------------------------- #
 def _soundcard_loopback(name: str):
-    """Возвращает loopback-«микрофон» нужных динамиков (по имени)."""
+    """Loopback-«микрофон» нужных динамиков (по имени, иначе — по умолчанию)."""
     import soundcard as sc
 
     if name:
@@ -1025,13 +916,12 @@ def _soundcard_loopback(name: str):
             return sc.get_microphone(id=name, include_loopback=True)
         except Exception as exc:  # noqa: BLE001
             log.info("Не удалось взять loopback «%s»: %s", name, exc)
-    # имена могли измениться — берём динамики по умолчанию
     return sc.get_microphone(id=str(sc.default_speaker().name),
                              include_loopback=True)
 
 
 def _soundcard_microphone(name: str):
-    """Возвращает микрофон по имени (иначе — микрофон по умолчанию)."""
+    """Микрофон по имени (иначе — микрофон по умолчанию)."""
     import soundcard as sc
 
     if name:
@@ -1046,3 +936,4 @@ def format_hms(seconds: float) -> str:
     """Форматирует секунды как ЧЧ:ММ:СС."""
     seconds = int(max(0, seconds))
     return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+

@@ -3,8 +3,7 @@ chcp 65001 >nul
 title Расшифровка занятий
 cd /d "%~dp0"
 
-echo Проверяю Python...
-python --version >nul 2>&1
+where python >nul 2>&1
 if errorlevel 1 (
     echo.
     echo [ОШИБКА] Python не найден.
@@ -15,23 +14,15 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not exist "venv\Scripts\python.exe" (
-    echo Первый запуск: создаю виртуальное окружение и ставлю библиотеки.
-    echo Это займёт несколько минут, нужен интернет.
-    python -m venv venv
-    if errorlevel 1 (
-        echo [ОШИБКА] Не удалось создать окружение venv.
-        pause
-        exit /b 1
-    )
+if not exist "venv\Scripts\pythonw.exe" (
+    echo Первый запуск: создаю окружение и ставлю библиотеки.
+    echo Это займёт несколько минут и потребует интернет.
+    python -m venv venv || (echo Не удалось создать venv & pause & exit /b 1)
     venv\Scripts\python.exe -m pip install --upgrade pip
-    venv\Scripts\python.exe -m pip install -r requirements.txt
-    if errorlevel 1 (
-        echo [ОШИБКА] Не удалось установить зависимости.
-        pause
-        exit /b 1
+    venv\Scripts\python.exe -m pip install -r requirements.txt || (
+        echo Не удалось установить зависимости & pause & exit /b 1
     )
 )
 
-venv\Scripts\python.exe main.py
-if errorlevel 1 pause
+start "" venv\Scripts\pythonw.exe main.py
+exit

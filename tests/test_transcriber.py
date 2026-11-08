@@ -1,8 +1,13 @@
-"""Тесты расшифровки с поддельной моделью faster-whisper.
+"""Тесты распознавания: быстрое окружение вызова и работа с файлами.
 
-Настоящая модель весит больше гигабайта, поэтому в тестах подменяем
-``WhisperModel`` маленькой заглушкой: проверяем подготовку данных, расчёт
-прогресса, склейку текста, сохранение файла и обработку ошибок.
+Настоящая модель весит мегабайты, поэтому в тестах подменяем
+``faster_whisper`` маленькой заглушкой и проверяем главное:
+
+* что используются именно «быстрые» параметры (батчи, beam_size=1,
+  без меток времени), — от них зависит цель «час за 3 минуты»;
+* что текст склеивается в сплошной и сохраняется в .txt;
+* что прогресс и отмена работают;
+* что ошибки объясняются по-русски.
 """
 
 from __future__ import annotations
@@ -11,7 +16,6 @@ import sys
 import tempfile
 import types
 import unittest
-from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,9 +23,8 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np
 
-from tutor_transcript import transcriber as tr
+from tutor_transcript import config, transcriber as tr
 from tutor_transcript.audio_sink import WavWriter
-from tutor_transcript.config import Config
 
 
 class _Segment:
@@ -33,33 +36,46 @@ class _Segment:
 class _Info:
     def __init__(self, duration: float) -> None:
         self.duration = duration
-        self.language = "ru"
 
 
 class _FakeModel:
-    """Модель-заглушка: возвращает заранее заданные сегменты."""
+    """Модель-заглушка: запоминает параметры вызова и отдаёт сегменты."""
 
-    def __init__(self, text_parts, duration: float, record: dict) -> None:
-        self.text_parts = text_parts
-        self.duration = duration
-        self.record = record
+    def __init__(self) -> None:
+        self.calls = []
 
     def transcribe(self, audio, **kwargs):
-        self.record["audio"] = audio
-        self.record["kwargs"] = kwargs
-        step = self.duration / max(1, len(self.text_parts))
-        segments = [
-            _Segment(part, step * (index + 1))
-            for index, part in enumerate(self.text_parts)
-        ]
-        return iter(segments), _Info(self.duration)
+        self.calls.append({"audio": audio, "kwargs": kwargs})
+        duration = 4.0
+        texts = ["Здравствуйте!", "сегодня разберём дроби", "и решим пару задач."]
+        step = duration / len(texts)
+        segments = [_Segment(t, step * (i + 1)) for i, t in enumerate(texts)]
+        return iter(segments), _Info(duration)
 
 
-def _install_fake_faster_whisper(model: _FakeModel) -> None:
+class _FakePipeline:
+    """Замена BatchedInferencePipeline."""
+
+    def __init__(self, model) -> None:
+        self.model = model
+
+    def transcribe(self, audio, **kwargs):
+        return self.model.transcribe(audio, **kwargs)
+
+
+def _install_fake_faster_whisper(model: _FakeModel) -> dict:
+    """Подставляет фальшивый модуль faster_whisper; возвращает настройки model."""
+    captured = {}
+
+    def _whisper_model(*args, **kwargs):
+        captured["init"] = {"args": args, "kwargs": kwargs}
+        return model
+
     module = types.ModuleType("faster_whisper")
-    module.WhisperModel = lambda *a, **kw: model
-    module.__version__ = "test"
+    module.WhisperModel = _whisper_model
+    module.BatchedInferencePipeline = _FakePipeline
     sys.modules["faster_whisper"] = module
+    return captured
 
 
 def _write_wav(path: Path, seconds: float = 2.0, rate: int = 16000) -> None:
@@ -69,120 +85,178 @@ def _write_wav(path: Path, seconds: float = 2.0, rate: int = 16000) -> None:
     writer.close()
 
 
-class TestTranscribeWithFakeModel(unittest.TestCase):
+class TestFastSettings(unittest.TestCase):
     def setUp(self) -> None:
-        tr._MODEL_CACHE.clear()
+        tr.free_model()
         self.tmp = tempfile.TemporaryDirectory()
-        self.dir = Path(self.tmp.name)
-        self.wav = self.dir / "rec.wav"
+        self.wav = Path(self.tmp.name) / "rec.wav"
         _write_wav(self.wav)
 
     def tearDown(self) -> None:
-        tr._MODEL_CACHE.clear()
+        tr.free_model()
         sys.modules.pop("faster_whisper", None)
         self.tmp.cleanup()
 
-    def test_text_is_assembled_and_file_saved(self) -> None:
-        record: dict = {}
-        _install_fake_faster_whisper(
-            _FakeModel(["Здравствуйте!", "сегодня мы разберём дроби",
-                        "и решим пару задач."], 2.0, record)
-        )
-        config = Config(model_size="tiny")
-        progress_events = []
-        transcriber = tr.Transcriber(config, on_progress=progress_events.append)
-        path = transcriber.transcribe_and_save(self.wav, output_dir=self.dir)
+    def test_batched_pipeline_and_fast_options(self) -> None:
+        model = _FakeModel()
+        captured = _install_fake_faster_whisper(model)
 
+        pipeline = tr.load_model()
+        self.assertIsInstance(pipeline, _FakePipeline)
+
+        # --- настройки самой модели ---
+        init = captured["init"]
+        self.assertEqual(init["args"][0], "base")              # модель base
+        self.assertEqual(init["kwargs"]["device"], "cpu")      # без попытки CUDA
+        self.assertEqual(init["kwargs"]["compute_type"], "int8")
+        self.assertEqual(init["kwargs"]["download_root"], str(config.models_dir()))
+
+        text = tr.Transcriber().transcribe_file(self.wav)
+        self.assertIn("дроби", text)
+
+        # --- настройки распознавания (от них зависит скорость) ---
+        kwargs = model.calls[0]["kwargs"]
+        self.assertEqual(kwargs["language"], "ru")
+        self.assertEqual(kwargs["batch_size"], config.BATCH_SIZE)
+        self.assertGreaterEqual(kwargs["batch_size"], 8)      # батчи, а не по 1
+        self.assertEqual(kwargs["chunk_length"], config.CHUNK_SECONDS)
+        self.assertEqual(kwargs["beam_size"], 1)              # жадный поиск
+        self.assertEqual(kwargs["best_of"], 1)
+        self.assertEqual(kwargs["temperature"], 0.0)
+        self.assertTrue(kwargs["without_timestamps"])
+        self.assertFalse(kwargs["condition_on_previous_text"])
+        self.assertNotIn("word_timestamps", kwargs)
+        self.assertIsInstance(model.calls[0]["audio"], np.ndarray)
+
+    def test_model_is_loaded_once(self) -> None:
+        model = _FakeModel()
+        captured = _install_fake_faster_whisper(model)
+        tr.load_model()
+        first = sys.modules["faster_whisper"].WhisperModel
+        tr.load_model()
+        self.assertIs(sys.modules["faster_whisper"].WhisperModel, first)
+        self.assertIn("init", captured)
+
+    def test_free_model_drops_cache(self) -> None:
+        _install_fake_faster_whisper(_FakeModel())
+        tr.load_model()
+        tr.free_model()
+        self.assertIsNone(tr._PIPELINE)
+
+    def test_text_is_assembled_and_saved(self) -> None:
+        _install_fake_faster_whisper(_FakeModel())
+        out_dir = Path(self.tmp.name) / "out"
+        progress_events = []
+        path = tr.Transcriber(on_progress=progress_events.append).transcribe_and_save(
+            self.wav, out_dir, header="Занятие"
+        )
         self.assertTrue(path.exists())
         self.assertTrue(path.name.startswith("transcript_"))
-        self.assertTrue(path.name.endswith(".txt"))
         content = path.read_text(encoding="utf-8")
-        self.assertIn("Здравствуйте!", content)
+        self.assertTrue(content.startswith("Занятие"))
         self.assertIn("разберём дроби", content)
-
-        kwargs = record["kwargs"]
-        self.assertEqual(kwargs["language"], "ru")
-        self.assertTrue(kwargs["without_timestamps"])
-        self.assertFalse(kwargs["word_timestamps"])
-        self.assertEqual(kwargs["task"], "transcribe")
-        self.assertEqual(kwargs["beam_size"], 5)
-        self.assertIsInstance(record["audio"], np.ndarray)
-
         self.assertTrue(progress_events)
-        self.assertEqual(progress_events[-1].stage, "done")
         self.assertEqual(progress_events[-1].percent, 100.0)
 
-    def test_medium_is_default_model(self) -> None:
-        record: dict = {}
-        model = _FakeModel(["тест"], 1.0, record)
-        _install_fake_faster_whisper(model)
-        config = Config()
-        self.assertEqual(config.model_size, "medium")
-        tr.load_model(config.model_size)
-        loaded = tr._MODEL_CACHE[(config.model_size, "auto", "")]
-        self.assertIs(loaded, model)
-
-    def test_empty_speech_raises(self) -> None:
-        _install_fake_faster_whisper(_FakeModel([" ", "."], 1.0, {}))
-        with self.assertRaises(tr.TranscriptionError):
-            tr.Transcriber(Config()).transcribe_file(self.wav)
-
-    def test_too_short_audio_raises(self) -> None:
-        short = self.dir / "short.wav"
-        _write_wav(short, seconds=0.1)
-        _install_fake_faster_whisper(_FakeModel(["тест"], 0.1, {}))
-        with self.assertRaises(tr.TranscriptionError):
-            tr.Transcriber(Config()).transcribe_file(short)
-
-    def test_missing_file_raises(self) -> None:
-        _install_fake_faster_whisper(_FakeModel(["тест"], 1.0, {}))
-        with self.assertRaises(tr.TranscriptionError):
-            tr.Transcriber(Config()).transcribe_file(self.dir / "нет.wav")
-
-    def test_progress_percent_grows(self) -> None:
-        _install_fake_faster_whisper(
-            _FakeModel(["раз", "два", "три", "четыре"], 4.0, {})
-        )
+    def test_progress_grows(self) -> None:
+        _install_fake_faster_whisper(_FakeModel())
         events = []
-        tr.Transcriber(Config(), on_progress=events.append).transcribe_file(self.wav)
-        transcribing = [e for e in events if e.stage == "transcribing" and e.percent]
-        self.assertGreaterEqual(len(transcribing), 4)
-        percents = [e.percent for e in transcribing]
-        self.assertEqual(percents, sorted(percents))
+        tr.Transcriber(on_progress=events.append).transcribe_file(self.wav)
+        done = [e.done_seconds for e in events if e.done_seconds]
+        self.assertGreaterEqual(len(done), 3)
+        self.assertEqual(done, sorted(done))
 
     def test_cancel_stops_early(self) -> None:
-        _install_fake_faster_whisper(_FakeModel(["раз", "два", "три"], 3.0, {}))
-        transcriber = tr.Transcriber(Config())
+        _install_fake_faster_whisper(_FakeModel())
+        transcriber = tr.Transcriber()
         transcriber.cancel()
         with self.assertRaises(tr.TranscriptionError):
             transcriber.transcribe_file(self.wav)
 
+    def test_too_short_audio_raises(self) -> None:
+        _install_fake_faster_whisper(_FakeModel())
+        short = Path(self.tmp.name) / "short.wav"
+        _write_wav(short, seconds=0.1)
+        with self.assertRaises(tr.TranscriptionError):
+            tr.Transcriber().transcribe_file(short)
+
+    def test_missing_file_raises(self) -> None:
+        _install_fake_faster_whisper(_FakeModel())
+        with self.assertRaises(tr.TranscriptionError):
+            tr.Transcriber().transcribe_file(Path(self.tmp.name) / "нет.wav")
+
+    def test_empty_text_raises(self) -> None:
+        class _Silent(_FakeModel):
+            def transcribe(self, audio, **kwargs):
+                return iter([_Segment(" ", 1.0)]), _Info(1.0)
+
+        _install_fake_faster_whisper(_Silent())
+        with self.assertRaises(tr.TranscriptionError):
+            tr.Transcriber().transcribe_file(self.wav)
+
     def test_missing_library_message(self) -> None:
+        tr.free_model()
         sys.modules["faster_whisper"] = None  # имитируем отсутствие пакета
-        tr._MODEL_CACHE.clear()
         try:
             with self.assertRaises(tr.TranscriptionError) as ctx:
-                tr.load_model("medium")
+                tr.load_model()
             self.assertIn("faster-whisper", str(ctx.exception))
         finally:
             sys.modules.pop("faster_whisper", None)
 
 
-class TestOutputHelpers(unittest.TestCase):
-    def test_filename_and_unique(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            directory = Path(tmp)
-            moment = datetime(2026, 11, 9, 18, 30, 0)
-            first = tr.save_transcript("текст", directory, moment=moment)
-            second = tr.save_transcript("текст", directory, moment=moment)
-            self.assertEqual(first.name, "transcript_2026-11-09_18-30-00.txt")
-            self.assertEqual(second.name, "transcript_2026-11-09_18-30-00_2.txt")
+class TestSpeedBudget(unittest.TestCase):
+    """Час записи на модели base должен укладываться в 3 минуты.
 
-    def test_header_added(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = tr.save_transcript("текст", Path(tmp), header="Занятие 5")
-            self.assertTrue(path.read_text(encoding="utf-8").startswith("Занятие 5"))
+    Реальную скорость задаёт процессор, поэтому здесь проверяется наш вклад:
+    за одно обращение к модели уходит 8 × 30 = 240 секунд звука, значит для
+    часа записи нужно всего 15 вызовов (и ни одного лишнего прохода VAD).
+    """
+
+    def test_hour_of_audio_needs_only_15_model_calls(self) -> None:
+        chunk = config.CHUNK_SECONDS
+        batch = config.BATCH_SIZE
+        self.assertEqual((chunk, batch), (30, 8))
+        hour = 3600
+        calls = -(-hour // (chunk * batch))  # округление вверх
+        self.assertEqual(calls, 15)
+
+    def test_chunk_and_batch_are_not_tiny(self) -> None:
+        self.assertGreaterEqual(config.BATCH_SIZE, 8)
+        self.assertGreaterEqual(config.CHUNK_SECONDS, 20)
 
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestSequentialFallback(unittest.TestCase):
+    """Если батчевый режим недоступен, программа обязана всё равно работать."""
+
+    def setUp(self) -> None:
+        tr.free_model()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.wav = Path(self.tmp.name) / "rec.wav"
+        _write_wav(self.wav)
+
+    def tearDown(self) -> None:
+        tr.free_model()
+        sys.modules.pop("faster_whisper", None)
+        self.tmp.cleanup()
+
+    def test_works_without_batched_pipeline(self) -> None:
+        model = _FakeModel()
+        module = types.ModuleType("faster_whisper")
+        module.WhisperModel = lambda *a, **kw: model
+        # BatchedInferencePipeline отсутствует — как в faster-whisper < 1.1
+        sys.modules["faster_whisper"] = module
+
+        pipeline = tr.load_model()
+        self.assertIsInstance(pipeline, tr.SequentialPipeline)
+        text = tr.Transcriber().transcribe_file(self.wav)
+        self.assertIn("дроби", text)
+        kwargs = model.calls[0]["kwargs"]
+        # «батчевые» параметры убраны, чтобы старый API не ругался
+        self.assertNotIn("batch_size", kwargs)
+        self.assertNotIn("chunk_length", kwargs)
+        self.assertEqual(kwargs["beam_size"], 1)

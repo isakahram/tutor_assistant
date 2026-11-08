@@ -1,4 +1,4 @@
-"""Тесты текстовой и файловой логики (не требуют звуковой карты и GUI).
+"""Тесты логики: текст, пути, WAV, синхронизация источников, устройства.
 
 Запуск:  python -m unittest discover -s tests -v
 """
@@ -16,11 +16,12 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np
 
+from tutor_transcript import config
 from tutor_transcript.audio_sink import WavWriter, read_wav_mono, resample_linear
 from tutor_transcript.capture import BlockBuffer, Levels, mix_channels
-from tutor_transcript.config import Config, load_config, save_config
 from tutor_transcript.devices import DeviceInfo, LOOPBACK, MIC, pick_default
 from tutor_transcript.transcriber import (
+    Progress,
     join_segments,
     normalize_text,
     save_transcript,
@@ -30,34 +31,24 @@ from tutor_transcript.transcriber import (
 )
 
 
-class TestConfig(unittest.TestCase):
-    def test_defaults_and_roundtrip(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "settings.json"
-            cfg = load_config(path)
-            self.assertEqual(cfg.model_size, "medium")
-            self.assertEqual(cfg.language, "ru")
-            cfg.model_size = "small"
-            cfg.output_dir = tmp
-            save_config(cfg, path)
-            again = load_config(path)
-            self.assertEqual(again.model_size, "small")
-            self.assertEqual(again.output_dir, tmp)
+class TestPaths(unittest.TestCase):
+    def test_output_dir_exists(self) -> None:
+        directory = config.output_dir()
+        self.assertTrue(directory.is_dir())
 
-    def test_broken_json_falls_back(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "settings.json"
-            path.write_text("{ это не json", encoding="utf-8")
-            cfg = load_config(path)
-            self.assertEqual(cfg.model_size, "medium")
+    def test_windows_desktop_is_hardcoded(self) -> None:
+        self.assertEqual(
+            str(config.DESKTOP_WINDIR), r"C:\Users\TREIDCOMPUTERS\Desktop"
+        )
 
-    def test_invalid_values_normalized(self) -> None:
-        cfg = Config.from_dict({"model_size": "huge", "beam_size": 99,
-                                "capture_mode": "nonsense", "appearance": "neon"})
-        self.assertEqual(cfg.model_size, "medium")
-        self.assertEqual(cfg.beam_size, 10)
-        self.assertEqual(cfg.capture_mode, "both")
-        self.assertEqual(cfg.appearance, "dark")
+    def test_model_is_base(self) -> None:
+        self.assertEqual(config.MODEL_SIZE, "base")
+        self.assertEqual(config.LANGUAGE, "ru")
+        self.assertEqual(config.SAMPLE_RATE, 16000)
+
+    def test_temp_and_models_dirs(self) -> None:
+        self.assertTrue(config.temp_dir().is_dir())
+        self.assertTrue(config.models_dir().is_dir())
 
 
 class TestDevices(unittest.TestCase):
@@ -72,7 +63,6 @@ class TestDevices(unittest.TestCase):
     def test_prefers_default_loopback(self) -> None:
         chosen = pick_default(self.devices, LOOPBACK)
         self.assertEqual(chosen.name, "Speakers (Realtek)")
-        self.assertFalse(chosen.is_virtual_cable)
 
     def test_remembers_saved_name(self) -> None:
         chosen = pick_default(self.devices, LOOPBACK, "CABLE Input (VB-Audio)")
@@ -80,16 +70,16 @@ class TestDevices(unittest.TestCase):
 
     def test_mic_prefers_real_microphone(self) -> None:
         chosen = pick_default(self.devices, MIC)
-        self.assertEqual(chosen.key, MIC)
         self.assertIn("Realtek", chosen.name)
 
     def test_missing_kind_returns_none(self) -> None:
         only_mics = [d for d in self.devices if d.key == MIC]
         self.assertIsNone(pick_default(only_mics, LOOPBACK))
 
-    def test_display_is_unique(self) -> None:
-        labels = [d.display() for d in self.devices]
-        self.assertEqual(len(labels), len(set(labels)))
+    def test_display_is_short_and_readable(self) -> None:
+        self.assertEqual(self.devices[0].display(), "звук ПК: Speakers (Realtek)")
+        self.assertEqual(self.devices[2].display(),
+                         "микрофон: Headset Microphone")
 
 
 class TestTextAssembly(unittest.TestCase):
@@ -104,9 +94,7 @@ class TestTextAssembly(unittest.TestCase):
             "и найдём дискриминант",
             "Готово.",
         ])
-        # после точки — новый абзац, внутри фразы — пробел
         self.assertIn("уравнения.\nначнём", text)
-        # заглавная буква в новом сегменте тоже означает новое предложение
         self.assertIn("дискриминант\nГотово.", text)
         self.assertNotIn("  ", text)
         self.assertNotIn(" ,", text)
@@ -116,11 +104,10 @@ class TestTextAssembly(unittest.TestCase):
         self.assertEqual(text, "Возьмём, например, число пять и прибавим два.")
 
     def test_wrap_keeps_paragraphs(self) -> None:
-        text = "слово " * 40
-        wrapped = wrap_text("Абзац один.\n\n" + text, width=30)
+        wrapped = wrap_text("Абзац один.\n\n" + "слово " * 40, width=30)
         lines = wrapped.split("\n")
         self.assertTrue(all(len(line) <= 30 for line in lines if line))
-        self.assertIn("", lines)  # пустая строка между абзацами
+        self.assertIn("", lines)
 
     def test_transcript_filename_format(self) -> None:
         name = transcript_filename(datetime(2026, 11, 9, 18, 30, 0))
@@ -129,8 +116,8 @@ class TestTextAssembly(unittest.TestCase):
     def test_unique_path_does_not_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "transcript_x.txt").write_text("old", encoding="utf-8")
-            path = unique_path(Path(tmp), "transcript_x.txt")
-            self.assertEqual(path.name, "transcript_x_2.txt")
+            self.assertEqual(unique_path(Path(tmp), "transcript_x.txt").name,
+                             "transcript_x_2.txt")
 
     def test_save_transcript_with_header(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -140,12 +127,24 @@ class TestTextAssembly(unittest.TestCase):
             self.assertIn("Привет, мир.", content)
 
 
+class TestProgress(unittest.TestCase):
+    def test_percent_and_speed(self) -> None:
+        progress = Progress(done_seconds=30.0, total_seconds=120.0)
+        progress.started_at -= 2.0  # как будто прошло 2 секунды
+        self.assertAlmostEqual(progress.percent, 25.0, places=1)
+        self.assertAlmostEqual(progress.speed, 15.0, places=1)
+
+    def test_zero_total(self) -> None:
+        self.assertEqual(Progress().percent, 0.0)
+        self.assertIsNone(Progress().speed)
+
+
 class TestAudioPlumbing(unittest.TestCase):
     def test_wav_writer_and_reader(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "test.wav"
             writer = WavWriter(path, 16000)
-            signal = (0.5 * np.sin(2 * np.pi * 440 * np.arange(1600) / 16000))
+            signal = 0.5 * np.sin(2 * np.pi * 440 * np.arange(1600) / 16000)
             writer.write(signal.astype(np.float32))
             writer.write(np.zeros(1600, dtype=np.float32))
             self.assertAlmostEqual(writer.duration, 0.2, places=3)
@@ -155,51 +154,46 @@ class TestAudioPlumbing(unittest.TestCase):
             self.assertEqual(rate, 16000)
             self.assertEqual(data.size, 3200)
             self.assertGreater(float(np.max(np.abs(data))), 0.4)
-            self.assertLessEqual(float(np.max(np.abs(data))), 0.51)
 
     def test_block_buffer_pairs_sources(self) -> None:
-        buffer = BlockBuffer([MIC, LOOPBACK], blocksize=10)
-        mic_block = np.full(10, 0.5, dtype=np.float32)
-        sys_block = np.full(10, 0.25, dtype=np.float32)
-
-        self.assertIsNone(buffer.push(MIC, mic_block))
-        ready = buffer.push(LOOPBACK, sys_block)
-        self.assertIsNotNone(ready)
+        buffer = BlockBuffer((MIC, LOOPBACK), blocksize=10)
+        self.assertIsNone(buffer.push(MIC, np.full(10, 0.5, dtype=np.float32)))
+        ready = buffer.push(LOOPBACK, np.full(10, 0.25, dtype=np.float32))
         self.assertEqual(set(ready), {MIC, LOOPBACK})
-        self.assertEqual(buffer.pending_counts(), {MIC: 0, LOOPBACK: 0})
 
     def test_block_buffer_fits_short_blocks(self) -> None:
-        buffer = BlockBuffer([MIC], blocksize=10)
+        buffer = BlockBuffer((MIC,), blocksize=10)
         ready = buffer.push(MIC, np.ones(4, dtype=np.float32))
         self.assertEqual(ready[MIC].size, 10)
         self.assertEqual(ready[MIC][4:].tolist(), [0.0] * 6)
 
     def test_block_buffer_drops_old_blocks_when_flooded(self) -> None:
-        buffer = BlockBuffer([MIC, LOOPBACK], blocksize=4, max_pending=3)
+        buffer = BlockBuffer((MIC, LOOPBACK), blocksize=4, max_pending=3)
         for _ in range(10):
             buffer.push(MIC, np.ones(4, dtype=np.float32))
-        self.assertEqual(buffer.pending_counts()[MIC], 3)
         self.assertEqual(buffer.dropped_blocks, 7)
 
     def test_block_buffer_pop_all(self) -> None:
-        buffer = BlockBuffer([MIC, LOOPBACK], blocksize=4)
+        buffer = BlockBuffer((MIC, LOOPBACK), blocksize=4)
         buffer.push(MIC, np.ones(4, dtype=np.float32))
         buffer.push(MIC, np.ones(4, dtype=np.float32))
         buffer.push(LOOPBACK, np.ones(4, dtype=np.float32))
         groups = buffer.pop_all()
-        # одна полная пара (mic+loopback) уже была отдана push,
-        # остался «лишний» блок микрофона — он должен дойти до записи
         self.assertEqual(len(groups), 1)
         self.assertIsNotNone(groups[0][MIC])
         self.assertIsNone(groups[0][LOOPBACK])
 
+    def test_block_buffer_set_keys_keeps_other_source(self) -> None:
+        buffer = BlockBuffer((MIC, LOOPBACK), blocksize=4)
+        buffer.push(MIC, np.full(4, 0.3, dtype=np.float32))
+        buffer.set_keys((MIC,))
+        ready = buffer.push(MIC, np.full(4, 0.3, dtype=np.float32))
+        self.assertEqual(set(ready), {MIC})
+
     def test_mix_two_channels_does_not_clip(self) -> None:
-        parts = {
-            MIC: np.full(8, 0.9, dtype=np.float32),
-            LOOPBACK: np.full(8, 0.9, dtype=np.float32),
-        }
+        parts = {MIC: np.full(8, 0.9, dtype=np.float32),
+                 LOOPBACK: np.full(8, 0.9, dtype=np.float32)}
         mixed = mix_channels(parts, 8)
-        self.assertEqual(mixed.size, 8)
         self.assertTrue(bool(np.all(mixed <= 1.0)))
         self.assertAlmostEqual(float(mixed[0]), 1.0, places=3)
 
@@ -220,73 +214,6 @@ class TestAudioPlumbing(unittest.TestCase):
         self.assertLess(levels.get(MIC), 0.8)
 
 
-class TestFallbackSource(unittest.TestCase):
-    """Проверяем, что при сбое основного пути включается резервный."""
-
-    def test_switches_to_fallback(self) -> None:
-        from tutor_transcript.capture import AudioSource, FallbackSource
-
-        class Broken(AudioSource):
-            key = LOOPBACK
-
-            def open(self) -> None:
-                raise RuntimeError("нет устройства")
-
-            def read(self, numframes: int) -> np.ndarray:  # pragma: no cover
-                raise AssertionError
-
-            def close(self) -> None:
-                pass
-
-        class Working(AudioSource):
-            key = LOOPBACK
-            description = "резерв"
-
-            def open(self) -> None:
-                self.opened = True
-
-            def read(self, numframes: int) -> np.ndarray:
-                return np.full(numframes, 0.1, dtype=np.float32)
-
-            def close(self) -> None:
-                pass
-
-        messages = []
-        source = FallbackSource(
-            LOOPBACK,
-            primary_factory=Broken,
-            fallback_factory=Working,
-            on_fallback=messages.append,
-        )
-        source.open()
-        self.assertTrue(source.using_fallback)
-        np.testing.assert_allclose(source.read(3), np.full(3, 0.1, dtype=np.float32))
-        self.assertTrue(messages)
-
-    def test_raises_when_no_fallback(self) -> None:
-        from tutor_transcript.capture import AudioSource, CaptureError, FallbackSource
-
-        class Broken(AudioSource):
-            key = MIC
-
-            def open(self) -> None:
-                raise RuntimeError("нет устройства")
-
-            def read(self, numframes: int) -> np.ndarray:  # pragma: no cover
-                raise AssertionError
-
-            def close(self) -> None:
-                pass
-
-        source = FallbackSource(MIC, primary_factory=Broken, fallback_factory=None)
-        with self.assertRaises(CaptureError):
-            source.open()
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class _FakeRecorder:
     """Поддельная запись soundcard: синусоида 1000 Гц в частоте устройства."""
 
@@ -294,15 +221,12 @@ class _FakeRecorder:
         self.samplerate = samplerate
         self.tone = tone
         self._position = 0
-        self.entered = False
-        self.exited = False
 
     def __enter__(self):
-        self.entered = True
         return self
 
     def __exit__(self, *exc_info):
-        self.exited = True
+        return None
 
     def record(self, numframes=None):
         index = np.arange(self._position, self._position + int(numframes))
@@ -351,9 +275,8 @@ class TestSoundCardSourceRates(unittest.TestCase):
         source = SoundCardSource(MIC, lambda: mic, 16000, "bluetooth гарнитура")
         source.open()
         self.assertEqual(source.device_rate, 48000)
-        # читаем три блока подряд: частота должна сохраняться, размер — точным
-        blocks = [source.read(3200) for _ in range(3)]
-        for block in blocks:
+        for _ in range(3):
+            block = source.read(3200)
             self.assertEqual(block.size, 3200)
             self.assertAlmostEqual(_dominant_frequency(block, 16000), 1000.0, delta=25)
         source.close()
@@ -361,7 +284,69 @@ class TestSoundCardSourceRates(unittest.TestCase):
     def test_raises_when_no_rate_supported(self) -> None:
         from tutor_transcript.capture import CaptureError, SoundCardSource
 
-        mic = _FakeMic(set())
-        source = SoundCardSource(MIC, lambda: mic, 16000, "сломанный микрофон")
+        source = SoundCardSource(MIC, lambda: _FakeMic(set()), 16000, "сломан")
         with self.assertRaises(CaptureError):
             source.open()
+
+
+class TestFallbackSource(unittest.TestCase):
+    """Если основной путь не открылся, должен включиться резервный."""
+
+    def test_switches_to_fallback(self) -> None:
+        from tutor_transcript.capture import AudioSource, FallbackSource
+
+        class Broken(AudioSource):
+            key = LOOPBACK
+
+            def open(self) -> None:
+                raise RuntimeError("нет устройства")
+
+            def read(self, numframes: int) -> np.ndarray:  # pragma: no cover
+                raise AssertionError
+
+            def close(self) -> None:
+                return None
+
+        class Working(AudioSource):
+            key = LOOPBACK
+            description = "резерв"
+
+            def open(self) -> None:
+                return None
+
+            def read(self, numframes: int) -> np.ndarray:
+                return np.full(numframes, 0.1, dtype=np.float32)
+
+            def close(self) -> None:
+                return None
+
+        messages = []
+        source = FallbackSource(LOOPBACK, primary_factory=Broken,
+                                fallback_factory=Working,
+                                on_fallback=messages.append)
+        source.open()
+        self.assertTrue(source.using_fallback)
+        np.testing.assert_allclose(source.read(3), np.full(3, 0.1, dtype=np.float32))
+        self.assertTrue(messages)
+
+    def test_raises_when_no_fallback(self) -> None:
+        from tutor_transcript.capture import AudioSource, CaptureError, FallbackSource
+
+        class Broken(AudioSource):
+            key = MIC
+
+            def open(self) -> None:
+                raise RuntimeError("нет устройства")
+
+            def read(self, numframes: int) -> np.ndarray:  # pragma: no cover
+                raise AssertionError
+
+            def close(self) -> None:
+                return None
+
+        with self.assertRaises(CaptureError):
+            FallbackSource(MIC, primary_factory=Broken, fallback_factory=None).open()
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

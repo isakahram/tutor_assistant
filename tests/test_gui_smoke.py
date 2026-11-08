@@ -1,15 +1,16 @@
-"""Дымовой тест интерфейса без реального Tk.
+"""Дымовые тесты окна без реального Tk.
 
-На машине без дисплея (например, на сервере) нельзя открыть окно, но можно
-подменить ``customtkinter`` и ``tkinter`` простыми заглушками и проверить, что
-вся логика окна работает: переключение состояний, заполнение списков
-устройств, обработка событий и сохранение результата.
+На машине без дисплея (сервер, CI) окно не открыть, но можно подменить
+``customtkinter``/``tkinter`` заглушками и проверить всю логику интерфейса:
+состояния кнопок, полный сценарий «Старт → Пауза → Расшифровка», сохранение
+файла, удаление временного WAV и показ ошибок.
 
 Запуск:  python -m unittest tests.test_gui_smoke -v
 """
 
 from __future__ import annotations
 
+import queue as queue_module
 import sys
 import tempfile
 import time
@@ -32,9 +33,8 @@ class _Widget:
         self.master = master
         self.options = dict(kwargs)
         self._state = kwargs.get("state", "normal")
-        self._value = kwargs.get("values", [""])[0] if kwargs.get("values") else ""
+        self._value = ""
 
-    # геометрия
     def grid(self, *args, **kwargs):
         return None
 
@@ -47,7 +47,6 @@ class _Widget:
     def grid_rowconfigure(self, *args, **kwargs):
         return None
 
-    # свойства
     def configure(self, **kwargs):
         if "state" in kwargs:
             self._state = kwargs["state"]
@@ -56,9 +55,7 @@ class _Widget:
     config = configure
 
     def cget(self, key):
-        if key == "state":
-            return self._state
-        return self.options.get(key, "")
+        return self._state if key == "state" else self.options.get(key, "")
 
     def set(self, value):
         self._value = value
@@ -67,23 +64,14 @@ class _Widget:
         return self._value
 
     def insert(self, *args, **kwargs):
-        # как у настоящего Entry: insert(index, text) — текст последний
         if args and isinstance(args[-1], str):
-            self._value = args[-1]
-        return None
+            self._value += args[-1]
 
     def delete(self, *args, **kwargs):
         self._value = ""
-        return None
 
     def see(self, *args, **kwargs):
         return None
-
-    def select(self):
-        self._checked = True
-
-    def deselect(self):
-        self._checked = False
 
     def start(self):
         return None
@@ -104,14 +92,13 @@ class _Root(_Widget):
     def geometry(self, spec):
         self._geometry = spec
 
-    def minsize(self, width, height):
+    def resizable(self, *args):
         return None
 
     def protocol(self, *args, **kwargs):
         return None
 
     def after(self, delay, callback=None, *args):
-        self._last_after = (delay, callback)
         return "after-id"
 
     def after_cancel(self, *args):
@@ -123,13 +110,7 @@ class _Root(_Widget):
     def bell(self):
         return None
 
-    def update(self):
-        return None
-
-    def grid_columnconfigure(self, *args, **kwargs):
-        return None
-
-    def grid_rowconfigure(self, *args, **kwargs):
+    def destroy(self):
         return None
 
 
@@ -139,32 +120,17 @@ class _Font:
 
 
 def _install_stubs() -> None:
-    """Подставляет фальшивые customtkinter/tkinter в sys.modules."""
     ctk = types.ModuleType("customtkinter")
     for name in (
-        "CTkFrame", "CTkLabel", "CTkButton", "CTkComboBox", "CTkSegmentedButton",
-        "CTkProgressBar", "CTkTextbox", "CTkEntry", "CTkOptionMenu",
-        "CTkScrollableFrame", "CTkSlider", "CTkSwitch",
+        "CTkFrame", "CTkLabel", "CTkButton", "CTkTextbox", "CTkEntry",
+        "CTkProgressBar", "CTkComboBox", "CTkOptionMenu", "CTkCheckBox",
+        "CTkSegmentedButton", "CTkScrollableFrame", "CTkSlider", "CTkSwitch",
     ):
         setattr(ctk, name, type(name, (_Widget,), {}))
-
-    class _CheckBox(_Widget):
-        """Как настоящий CTkCheckBox: get() возвращает 1 или 0."""
-
-        def __init__(self, master=None, **kwargs) -> None:
-            super().__init__(master, **kwargs)
-            self._checked = False
-
-        def get(self):
-            return 1 if self._checked else 0
-
-    ctk.CTkCheckBox = _CheckBox
     ctk.CTk = _Root
     ctk.CTkFont = _Font
     ctk.set_appearance_mode = lambda mode: None
     ctk.set_default_color_theme = lambda theme: None
-    ctk.get_appearance_mode = lambda: "Dark"
-    sys.modules["customtkinter"] = ctk
 
     tk = types.ModuleType("tkinter")
 
@@ -180,16 +146,15 @@ def _install_stubs() -> None:
 
     filedialog = types.ModuleType("tkinter.filedialog")
     filedialog.askdirectory = lambda **kwargs: ""
-    filedialog.askopenfilename = lambda **kwargs: ""
     tk.filedialog = filedialog
 
     messagebox = types.ModuleType("tkinter.messagebox")
     messagebox.showerror = lambda *a, **k: None
     messagebox.showinfo = lambda *a, **k: None
-    messagebox.showwarning = lambda *a, **k: None
     messagebox.askyesno = lambda *a, **k: True
     tk.messagebox = messagebox
 
+    sys.modules["customtkinter"] = ctk
     sys.modules["tkinter"] = tk
     sys.modules["tkinter.filedialog"] = filedialog
     sys.modules["tkinter.messagebox"] = messagebox
@@ -197,132 +162,29 @@ def _install_stubs() -> None:
 
 _install_stubs()
 
+import tutor_transcript.gui as gui  # noqa: E402
 from tutor_transcript.capture import RecordingResult  # noqa: E402
-from tutor_transcript.config import Config  # noqa: E402
-from tutor_transcript.devices import DeviceInfo, LOOPBACK, MIC  # noqa: E402
-from tutor_transcript.gui import TutorTranscriptApp  # noqa: E402
-from tutor_transcript.transcriber import TranscriptionProgress  # noqa: E402
-
-
-class TestGuiSmoke(unittest.TestCase):
-    def setUp(self) -> None:
-        self.tmp = tempfile.TemporaryDirectory()
-        self.app = TutorTranscriptApp(Config(), autoload_devices=False)
-
-    def tearDown(self) -> None:
-        try:
-            self.app._closing = True
-            self.app.destroy()
-        except Exception:
-            pass
-        self.tmp.cleanup()
-
-    # ------------------------------------------------------------------ #
-    def test_all_states_toggle_without_error(self) -> None:
-        for state in ("idle", "recording", "paused", "stopping",
-                      "transcribing", "busy", "idle"):
-            self.app._apply_state(state)
-        self.assertEqual(self.app.start_button.cget("state"), "normal")
-
-    def test_devices_are_listed(self) -> None:
-        devices = [
-            DeviceInfo(LOOPBACK, "Динамики (Realtek)", 2, True),
-            DeviceInfo(MIC, "Микрофон (USB)", 1, True),
-        ]
-        self.app._apply_devices(devices)
-        self.assertEqual(len(self.app.devices), 2)
-        self.assertIn("Динамики", self.app.system_device_combo.get())
-        self.assertIn("Микрофон", self.app.mic_device_combo.get())
-
-    def test_no_devices_gives_warning(self) -> None:
-        self.app._apply_devices([])
-        self.assertEqual(self.app.devices, [])
-        self.assertIn("не найден", self.app.mic_device_combo.get())
-
-    def test_events_are_handled(self) -> None:
-        result = RecordingResult(
-            wav_path=Path(self.tmp.name) / "rec.wav",
-            duration=12.5,
-            started_at=datetime.now(),
-            stopped_at=datetime.now(),
-            sources={LOOPBACK: "Динамики", MIC: "Микрофон"},
-            warnings=["тестовое предупреждение"],
-        )
-        self.app._handle_event("log", ("проверка журнала", "info"))
-        self.app._handle_event("progress", TranscriptionProgress(percent=42.0,
-                                                                message="идёт"))
-        self.app._handle_event("status", "статус")
-        self.app._handle_event("model_status", "модель")
-        self.app._handle_event("recorded", result)
-        self.app._handle_event("idle", None)
-
-        self.assertTrue(True)  # главное — отсутствие исключений
-
-    def test_transcript_saved_reaction(self) -> None:
-        path = Path(self.tmp.name) / "transcript_x.txt"
-        path.write_text("текст", encoding="utf-8")
-        self.app._handle_event("transcript", path)
-        self.assertEqual(self.app.last_transcript, path)
-        self.assertEqual(self.app.open_file_button.cget("state"), "normal")
-
-    def test_error_reported(self) -> None:
-        self.app._on_transcription_done("нет модели")
-        self.assertEqual(self.app.start_button.cget("state"), "normal")
-
-    def test_config_roundtrip_via_ui(self) -> None:
-        self.app.path_entry.delete(0, "end")
-        self.app.path_entry.insert(0, self.tmp.name)
-        self.app._on_mode_change("Только микрофон")
-        self.app._on_model_change("small")
-        self.app._sync_config_from_ui()
-        self.assertEqual(self.app.config_data.capture_mode, "mic")
-        self.assertEqual(self.app.config_data.model_size, "small")
-        self.assertEqual(self.app.config_data.output_dir, self.tmp.name)
-        self.assertEqual(self.app._current_output_dir(), Path(self.tmp.name))
-
-    def test_start_recording_without_devices_still_starts(self) -> None:
-        """Даже без устройств запись стартует (источник-заглушка) и корректно
-        останавливается — это важно, чтобы приложение не зависало."""
-        self.app._preload_model = lambda: None
-        self.app.on_start()
-        self.assertIsNotNone(self.app.controller)
-        self.assertTrue(self.app.controller.is_recording)
-        self.app._apply_state("recording")
-        self.app.on_pause()
-        self.assertTrue(self.app.controller.is_paused)
-        self.app.on_pause()
-        self.assertFalse(self.app.controller.is_paused)
-        result = self.app.controller.stop()
-        self.assertIsInstance(result, RecordingResult)
-        self.assertGreaterEqual(result.duration, 0.0)
-
-    def test_close_stops_and_saves(self) -> None:
-        self.app._on_close()
-        self.assertTrue(self.app._closing)
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+from tutor_transcript.devices import LOOPBACK, MIC  # noqa: E402
+from tutor_transcript.transcriber import Progress  # noqa: E402
 
 
 class _FakeController:
-    """Подмена RecordingController для проверки полного сценария в окне."""
+    """Подмена RecordingController."""
 
-    def __init__(self, config, levels=None, on_log=None) -> None:
-        self.config = config
-        self.levels = levels
+    workdir = Path(tempfile.mkdtemp())
+
+    def __init__(self, on_log=None) -> None:
         self._on_log = on_log
+        self.levels = types.SimpleNamespace(get=lambda key: 0.5)
         self.is_recording = False
         self.is_paused = False
-        self.source_errors = []
-        self.warnings = []
         self.source_keys = (MIC, LOOPBACK)
         self.elapsed = 0.0
-        self.wav_path = Path(tempfile.mkdtemp()) / "fake.wav"
+        self.wav_path = _FakeController.workdir / f"rec_{id(self)}.wav"
 
-    def start(self):
+    def start(self, output_wav=None):
         self.is_recording = True
-        self.wav_path.write_bytes(b"RIFF....")  # имитация файла записи
+        self.wav_path.write_bytes(b"RIFF0000WAVE")  # имитация записи
         return self.wav_path
 
     def toggle_pause(self):
@@ -331,8 +193,6 @@ class _FakeController:
 
     def stop(self):
         self.is_recording = False
-        from tutor_transcript.capture import RecordingResult
-
         return RecordingResult(
             wav_path=self.wav_path,
             duration=125.0,
@@ -347,43 +207,53 @@ class _FakeTranscriber:
     """Подмена Transcriber: «распознаёт» заготовленный текст."""
 
     calls = []
+    fail_with = None
 
-    def __init__(self, config, on_progress=None, on_status=None) -> None:
-        self.config = config
+    def __init__(self, on_progress=None, on_status=None) -> None:
         self._on_progress = on_progress
         self._on_status = on_status
 
-    def transcribe_file(self, path):
-        _FakeTranscriber.calls.append(Path(path))
+    def cancel(self) -> None:
+        return None
+
+    def transcribe_and_save(self, wav_path, directory, header=None):
+        _FakeTranscriber.calls.append({"wav": Path(wav_path),
+                                       "dir": Path(directory), "header": header})
+        if _FakeTranscriber.fail_with:
+            raise gui.TranscriptionError(_FakeTranscriber.fail_with)
         if self._on_progress is not None:
-            self._on_progress(TranscriptionProgress(percent=50.0, message="половина"))
-        return "Сегодня разбирали задачи на проценты. Домашнее задание: № 12, 14."
+            self._on_progress(Progress(done_seconds=60.0, total_seconds=120.0,
+                                       message="Распознано 00:01:00 из 00:02:00"))
+        text = "Сегодня разбирали задачи на проценты. Домашнее задание: № 12, 14."
+        return _save(directory, header, text)
 
 
-class TestFullScenario(unittest.TestCase):
-    """Старт → пауза → стоп → расшифровка → файл на диске."""
+def _save(directory, header, text):
+    """Сохраняет «распознанный» текст так же, как это делает программа."""
+    from tutor_transcript.transcriber import save_transcript
 
+    return save_transcript(text, directory, header=header)
+
+
+class BaseGuiTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        self.out = Path(self.tmp.name) / "out"
+        self.out = Path(self.tmp.name) / "desktop"
         self.out.mkdir()
-        import tutor_transcript.gui as gui
 
-        self.gui = gui
-        self._orig_controller = gui.RecordingController
-        self._orig_transcriber = gui.Transcriber
+        self._orig = (gui.RecordingController, gui.Transcriber, gui.output_dir)
         gui.RecordingController = _FakeController
         gui.Transcriber = _FakeTranscriber
+        gui.output_dir = lambda: self.out
         _FakeTranscriber.calls = []
+        _FakeTranscriber.fail_with = None
 
-        self.app = TutorTranscriptApp(Config(), autoload_devices=False)
-        self.app.path_entry.delete(0, "end")
-        self.app.path_entry.insert(0, str(self.out))
-        self.app._preload_model = lambda: None
+        self.app = gui.App()
+        # фоновую подготовку (описание окружения и загрузку модели) не ждём
+        self.app._prepare = lambda: None
 
     def tearDown(self) -> None:
-        self.gui.RecordingController = self._orig_controller
-        self.gui.Transcriber = self._orig_transcriber
+        gui.RecordingController, gui.Transcriber, gui.output_dir = self._orig
         try:
             self.app._closing = True
             self.app.destroy()
@@ -391,10 +261,7 @@ class TestFullScenario(unittest.TestCase):
             pass
         self.tmp.cleanup()
 
-    def _drain(self) -> None:
-        """Разбирает очередь событий, как это делает _poll_events."""
-        import queue as queue_module
-
+    def drain(self) -> None:
         while True:
             try:
                 kind, payload = self.app.events.get_nowait()
@@ -402,56 +269,127 @@ class TestFullScenario(unittest.TestCase):
                 break
             self.app._handle_event(kind, payload)
 
-    def test_recording_transcription_and_cleanup(self) -> None:
+    def wait_done(self, predicate, timeout: float = 8.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.drain()
+            if predicate():
+                return
+            time.sleep(0.05)
+        self.fail("сценарий не завершился за отведённое время")
+
+
+class TestUiStructure(BaseGuiTest):
+    """Интерфейс должен содержать только то, что просил пользователь."""
+
+    def test_only_three_buttons_and_no_extra_widgets(self) -> None:
+        self.assertTrue(hasattr(self.app, "start_button"))
+        self.assertTrue(hasattr(self.app, "pause_button"))
+        self.assertTrue(hasattr(self.app, "transcribe_button"))
+        for unwanted in ("mode_switch", "mic_level", "system_level",
+                         "model_menu", "path_entry", "refresh_button",
+                         "choose_dir_button", "keep_audio_check",
+                         "theme_menu", "progress_bar", "system_device_combo"):
+            self.assertFalse(hasattr(self.app, unwanted),
+                             f"лишний элемент интерфейса: {unwanted}")
+
+    def test_buttons_names(self) -> None:
+        self.assertIn("Старт", self.app.start_button.options["text"])
+        self.assertIn("Пауза", self.app.pause_button.options["text"])
+        self.assertIn("Расшифровка", self.app.transcribe_button.options["text"])
+
+    def test_initial_state(self) -> None:
+        self.assertEqual(self.app.start_button.cget("state"), "normal")
+        self.assertEqual(self.app.pause_button.cget("state"), "disabled")
+        self.assertEqual(self.app.transcribe_button.cget("state"), "disabled")
+
+    def test_states_toggle(self) -> None:
+        for state in ("recording", "paused", "stopping", "transcribing", "idle"):
+            self.app._set_state(state)
+        self.assertEqual(self.app.start_button.cget("state"), "normal")
+
+
+class TestScenario(BaseGuiTest):
+    def test_start_pause_resume(self) -> None:
         self.app.on_start()
         self.assertTrue(self.app.controller.is_recording)
-        self.assertEqual(self.app.stop_button.cget("state"), "normal")
+        self.assertEqual(self.app.transcribe_button.cget("state"), "normal")
+        self.assertEqual(self.app.status_label.options["text"], "● Идёт запись")
 
         self.app.on_pause()
-        self.assertEqual(self.app.status_label.options.get("text"),
-                         "⏸ Пауза — звук не записывается")
+        self.assertTrue(self.app.controller.is_paused)
+        self.assertIn("Пауза", self.app.status_label.options["text"])
+        self.assertIn("Продолжить", self.app.pause_button.options["text"])
+
         self.app.on_pause()
-        self.assertEqual(self.app.status_label.options.get("text"), "● Идёт запись")
+        self.assertFalse(self.app.controller.is_paused)
+        self.assertEqual(self.app.status_label.options["text"], "● Идёт запись")
 
-        self.app.on_stop()
-        # дождаться рабочего потока остановки и расшифровки
-        for _ in range(100):
-            if self.app.last_transcript is not None:
-                break
-            time.sleep(0.05)
-            self._drain()
-
-        self.assertIsNotNone(self.app.last_transcript, "расшифровка не сохранилась")
-        saved = self.app.last_transcript
-        self.assertTrue(saved.exists())
-        self.assertTrue(saved.name.startswith("transcript_"))
-        self.assertIn("проценты", saved.read_text(encoding="utf-8"))
-        self.assertIn("Длительность: 00:02:05", saved.read_text(encoding="utf-8"))
-        self.assertEqual(self.app.start_button.cget("state"), "normal")
-        self.assertEqual(self.app.open_file_button.cget("state"), "normal")
-        self.assertEqual(_FakeTranscriber.calls[0], self.app.controller.wav_path)
-
-    def test_temp_audio_removed_when_not_kept(self) -> None:
+    def test_transcribe_saves_text_and_removes_wav(self) -> None:
         self.app.on_start()
         wav = self.app.controller.wav_path
-        self.app.on_stop()
-        for _ in range(100):
-            if self.app.last_transcript is not None and not wav.exists():
-                break
-            time.sleep(0.05)
-            self._drain()
-        self.assertFalse(wav.exists(), "временный файл должен удаляться")
-        # рядом с текстом не должно появиться WAV
+        self.assertTrue(wav.exists())
+
+        self.app.on_transcribe()
+        self.wait_done(lambda: self.app.last_transcript is not None)
+
+        saved = self.app.last_transcript
+        self.assertTrue(saved.exists())
+        self.assertTrue(saved.parent == self.out, "текст должен лечь на рабочий стол")
+        content = saved.read_text(encoding="utf-8")
+        self.assertIn("проценты", content)
+        self.assertIn("Длительность: 00:02:05", content)
+
+        # временный WAV удалён, рядом с текстом ничего лишнего
+        self.wait_done(lambda: not wav.exists())
         self.assertEqual(list(self.out.glob("*.wav")), [])
 
-    def test_audio_kept_when_requested(self) -> None:
-        self.app.keep_audio_check.select()
-        self.app.config_data.keep_audio = True
+        # интерфейс вернулся в исходное состояние
+        self.wait_done(lambda: self.app.start_button.cget("state") == "normal")
+        self.assertEqual(self.app.open_button.cget("state"), "normal")
+        self.assertIn("Готово", self.app.status_label.options["text"])
+
+        # расшифровке передан именно тот файл, который записали
+        self.assertEqual(_FakeTranscriber.calls[0]["wav"], wav)
+        self.assertEqual(_FakeTranscriber.calls[0]["dir"], self.out)
+
+    def test_transcription_error_keeps_ui_alive(self) -> None:
+        _FakeTranscriber.fail_with = "модель не загрузилась"
         self.app.on_start()
-        self.app.on_stop()
-        for _ in range(100):
-            if self.app.last_transcript is not None and list(self.out.glob("*.wav")):
-                break
-            time.sleep(0.05)
-            self._drain()
-        self.assertTrue(list(self.out.glob("*.wav")), "WAV должен остаться рядом с текстом")
+        self.app.on_transcribe()
+        self.wait_done(lambda: self.app.start_button.cget("state") == "normal")
+        self.assertIn("Не удалось", self.app.status_label.options["text"])
+        self.assertIn("модель не загрузилась", self.app.log_box._value)
+
+    def test_error_keeps_audio_for_retry(self) -> None:
+        _FakeTranscriber.fail_with = "нет интернета"
+        self.app.on_start()
+        wav = self.app.controller.wav_path
+        self.app.on_transcribe()
+        self.wait_done(lambda: self.app.start_button.cget("state") == "normal")
+        self.assertTrue(wav.exists(), "при ошибке запись нельзя удалять")
+        self.assertIsNone(self.app.last_transcript)
+
+    def test_empty_recording_is_not_transcribed(self) -> None:
+        class _Empty(_FakeController):
+            def stop(self):
+                result = super().stop()
+                result.duration = 0.2
+                return result
+
+        gui.RecordingController = _Empty
+        self.app.on_start()
+        self.app.on_transcribe()
+        self.wait_done(lambda: self.app.start_button.cget("state") == "normal")
+        self.assertEqual(_FakeTranscriber.calls, [])
+        self.assertIsNone(self.app.last_transcript)
+
+    def test_close_stops_recording(self) -> None:
+        self.app.on_start()
+        self.app._on_close()
+        self.assertTrue(self.app._closing)
+        self.assertFalse(self.app.controller.is_recording)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

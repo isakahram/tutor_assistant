@@ -1,8 +1,9 @@
-"""Поиск аудиоустройств: системный звук (loopback) и микрофон.
+"""Выбор двух устройств записи: системный звук (loopback) и микрофон.
 
-Модуль ничего не записывает — он только отвечает на вопросы «какие устройства
-есть» и «какое выбрать». Библиотеки импортируются лениво, чтобы приложение
-запускалось и показывало понятную ошибку, даже если чего-то не установлено.
+Пользователь всегда пишет оба источника, поэтому выбирать ничего не нужно:
+берём динамики по умолчанию (их loopback-копию) и микрофон по умолчанию.
+Модуль ничего не записывает и не держит интерфейс — только отвечает, что
+именно открывать.
 """
 
 from __future__ import annotations
@@ -10,13 +11,12 @@ from __future__ import annotations
 import difflib
 import logging
 import sys
-import threading
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
-#: Ключи, которые понимает :func:`find_device`.
+#: Ключи источников: системный звук (loopback) и микрофон.
 LOOPBACK = "loopback"
 MIC = "mic"
 
@@ -32,7 +32,7 @@ _VIRTUAL_KEYWORDS = ("cable", "vb-audio", "virtual", "voicemeeter", "кабел�
 
 @dataclass(frozen=True)
 class DeviceInfo:
-    """Одно аудиоустройство в том виде, в котором его показывает интерфейс."""
+    """Одно аудиоустройство, которое мы умеем открывать."""
 
     key: str            # LOOPBACK или MIC
     name: str           # имя устройства
@@ -53,15 +53,8 @@ class DeviceInfo:
         return self.is_loopback and any(word in low for word in _VIRTUAL_KEYWORDS)
 
     def display(self) -> str:
-        """Строка для выпадающего списка."""
-        marks = []
-        if self.is_default:
-            marks.append("по умолчанию")
-        if self.is_virtual_cable:
-            marks.append("виртуальный кабель")
-        suffix = f"  ·  {', '.join(marks)}" if marks else ""
-        channels = f"{self.channels} кан." if self.channels else "?"
-        return f"[{self.kind_label}, {channels}] {self.name}{suffix}"
+        """Короткое описание для журнала: «звук ПК: Динамики (Realtek)»."""
+        return f"{self.kind_label}: {self.name}"
 
 
 # --------------------------------------------------------------------------- #
@@ -206,14 +199,8 @@ def pick_default(devices: Iterable[DeviceInfo], key: str,
     return candidates[0]
 
 
-def find_device(devices: Iterable[DeviceInfo], key: str,
-                prefer: Optional[str] = None) -> Optional[DeviceInfo]:
-    """Синоним :func:`pick_default` (имя оставлено для читаемости кода)."""
-    return pick_default(devices, key, prefer)
-
-
 def describe_runtime() -> str:
-    """Одна строка о платформе и установленных библиотеках — для статуса."""
+    """Одна строка о платформе и установленных библиотеках — для журнала."""
     parts = [f"Python {sys.version.split()[0]}", sys.platform]
     sc, error = _soundcard_module()
     parts.append("soundcard OK" if sc else f"soundcard НЕТ ({error})")
@@ -222,7 +209,7 @@ def describe_runtime() -> str:
 
         parts.append("sounddevice OK")
     except Exception:  # noqa: BLE001
-        parts.append("sounddevice НЕТ")
+        parts.append("sounddevice не установлен")
     try:
         import faster_whisper  # noqa: F401
 
@@ -232,14 +219,13 @@ def describe_runtime() -> str:
     return " · ".join(parts)
 
 
-#: Кэш списка устройств, чтобы не дёргать WASAPI на каждый чих.
-_cache_lock = threading.Lock()
-_cache: Optional[List[DeviceInfo]] = None
+def choose_sources() -> Tuple[Optional[DeviceInfo], Optional[DeviceInfo]]:
+    """Возвращает пару (системный звук, микрофон) — по устройству по умолчанию.
 
-
-def cached_devices(refresh: bool = False) -> List[DeviceInfo]:
-    global _cache
-    with _cache_lock:
-        if _cache is None or refresh:
-            _cache = list_devices()
-        return list(_cache)
+    ``None`` означает «такого устройства сейчас нет»: тогда запись пойдёт без
+    него (второй источник продолжит писаться).
+    """
+    devices = list_devices()
+    system = pick_default(devices, LOOPBACK)
+    mic = pick_default(devices, MIC)
+    return system, mic
