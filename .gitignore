@@ -1,0 +1,34 @@
+# Виртуальное окружение и интерпретатор
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Временные файлы приложения
+*.wav
+*.mp3
+*.m4a
+!assets/*
+temp/
+transcript_*.txt
+# ...кроме примера результата в папке examples
+!examples/*.txt
+
+# Модели распознавания и кеши
+models/
+*.bin
+.cache/
+.cache_whisper/
+
+# Настройки и журналы
+settings.json
+app.log
+*.log
+
+# Системное
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
