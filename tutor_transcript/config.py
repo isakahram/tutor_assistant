@@ -1,43 +1,50 @@
-"""Настройки приложения, служебные пути и журнал работы.
+"""Пути, константы и журнал работы.
 
-Все пользовательские настройки хранятся в файле ``settings.json`` рядом
-с данными приложения:
-
-* Windows: ``%APPDATA%\\TutorTranscript\\settings.json``
-* Linux/macOS: ``~/.config/TutorTranscript/settings.json``
-
-Файл можно править вручную — при следующем запуске настройки подхватятся.
+Настроек больше нет: программа делает ровно одну вещь — пишет системный звук
+вместе с микрофоном и распознаёт запись моделью ``base`` настолько быстро,
+насколько позволяет компьютер. Все параметры — константы в этом файле,
+их можно поправить прямо в коде.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import logging.handlers
 import os
 import sys
-from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Any, Dict, Optional
 
 APP_NAME = "TutorTranscript"
 APP_TITLE = "Расшифровка занятий"
-APP_SUBTITLE = "Запись системного звука и микрофона → текст (локально, без облака)"
+APP_SUBTITLE = "Запись звука занятия → текст"
 
-#: Доступные размеры модели faster-whisper.
-MODEL_CHOICES = ("tiny", "base", "small", "medium", "large-v3")
+#: Папка сохранения расшифровок — рабочий стол (Windows).
+DESKTOP_WINDIR = Path(r"C:\Users\TREIDCOMPUTERS\Desktop")
 
-#: Режимы записи: ключ → подпись в интерфейсе.
-CAPTURE_MODES: Dict[str, str] = {
-    "both": "Оба источника",
-    "system": "Только звук компьютера",
-    "mic": "Только микрофон",
-}
+#: Модель распознавания. ``base`` — требование скорости; менять не нужно.
+MODEL_SIZE = "base"
 
-#: Частота дискретизации, в которой мы пишем WAV (её же ждёт Whisper).
+#: Язык распознавания (передаётся в модель явно).
+LANGUAGE = "ru"
+
+#: Частота дискретизации WAV (её же ждёт Whisper — без пересчёта).
 SAMPLE_RATE = 16_000
 
-SETTINGS_FILENAME = "settings.json"
+#: Сколько секунд звука модель обрабатывает за один проход (батч).
+#: Чанки по 30 с — это максимальный контекст Whisper; 8 штук в батче дают
+#: максимальную загрузку всех ядер процессора.
+CHUNK_SECONDS = 30
+BATCH_SIZE = 8
+
+#: Сколько потоков отдавать CTranslate2 (0 — определить автоматически).
+CPU_THREADS = 0
+
+#: Сколько секунд будем ждать закрытия потока при остановке записи.
+STOP_TIMEOUT = 5.0
+
+#: Раз в сколько секунд обновлять состояние в журнале/интерфейсе.
+UI_TICK_MS = 250
+
 LOG_FILENAME = "app.log"
 
 
@@ -45,7 +52,7 @@ LOG_FILENAME = "app.log"
 #  Пути
 # --------------------------------------------------------------------------- #
 def app_data_dir() -> Path:
-    """Папка для служебных файлов приложения (создаётся при необходимости)."""
+    """Папка для служебных файлов приложения (журнал, модели, временный WAV)."""
     if sys.platform == "win32":
         base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
     else:
@@ -55,30 +62,44 @@ def app_data_dir() -> Path:
     return path
 
 
-def default_output_dir() -> Path:
-    """Папка «Документы» текущего пользователя — сюда сохраняем расшифровки."""
-    candidates = []
+def output_dir() -> Path:
+    """Куда сохранять расшифровки: рабочий стол, а если его нет — домой.
 
+    На Windows это всегда ``C:\\Users\\TREIDCOMPUTERS\\Desktop`` (создаётся,
+    если его почему-то нет). На других системах берётся «Рабочий стол»
+    текущего пользователя, чтобы программу можно было запустить и проверить
+    не только на вашем компьютере.
+    """
     if sys.platform == "win32":
-        userprofile = os.environ.get("USERPROFILE")
-        if userprofile:
-            candidates.append(Path(userprofile) / "Documents")
-    # Домашняя папка / Documents на остальных системах
-    candidates.append(Path.home() / "Documents")
-    candidates.append(Path.home() / "Документы")
-    candidates.append(Path.home())
+        desktop = DESKTOP_WINDIR
+    else:
+        home = Path.home()
+        desktop = home / "Desktop"
+        if not desktop.is_dir():
+            desktop = home / "Рабочий стол"
+        if not desktop.is_dir():
+            desktop = home
+    try:
+        desktop.mkdir(parents=True, exist_ok=True)
+        return desktop
+    except OSError:
+        fallback = Path.home()
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
 
-    for candidate in candidates:
-        try:
-            if candidate.is_dir():
-                return candidate
-        except OSError:  # pragma: no cover - защита от необычных ФС
-            continue
-    return Path.home()
+
+def temp_dir() -> Path:
+    """Папка для временного WAV (удаляется сразу после расшифровки)."""
+    path = app_data_dir() / "temp"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
-def settings_path() -> Path:
-    return app_data_dir() / SETTINGS_FILENAME
+def models_dir() -> Path:
+    """Папка, куда один раз скачивается модель распознавания."""
+    path = app_data_dir() / "models"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def log_path() -> Path:
@@ -86,102 +107,10 @@ def log_path() -> Path:
 
 
 # --------------------------------------------------------------------------- #
-#  Настройки
-# --------------------------------------------------------------------------- #
-@dataclass
-class Config:
-    """Пользовательские настройки (сериализуются в settings.json)."""
-
-    # --- распознавание ---
-    model_size: str = "medium"       # medium по умолчанию, small — если медленно
-    language: str = "ru"             # язык распознавания
-    compute_type: str = ""           # "" = подобрать автоматически (int8 для CPU)
-    beam_size: int = 5               # качество/скорость: 1 — быстрее, 5 — точнее
-    vad_filter: bool = True          # вырезать паузы перед распознаванием
-
-    # --- запись ---
-    capture_mode: str = "both"       # both | system | mic
-    system_device: str = ""          # имя loopback-устройства ("" = по умолчанию)
-    mic_device: str = ""             # имя микрофона ("" = по умолчанию)
-    allow_sounddevice_fallback: bool = True  # запасной путь для системного звука
-
-    # --- файлы ---
-    output_dir: str = ""             # "" = папка «Документы»
-    keep_audio: bool = False         # сохранять рядом с расшифровкой и WAV
-
-    # --- интерфейс ---
-    appearance: str = "dark"         # dark | light | system
-
-    # ------------------------------------------------------------------ #
-    def resolved_output_dir(self) -> Path:
-        """Папка для сохранения расшифровок (существующая, если возможно)."""
-        if self.output_dir:
-            path = Path(self.output_dir).expanduser()
-            if path.is_dir():
-                return path
-        return default_output_dir()
-
-    def normalized(self) -> "Config":
-        """Приводит значения к допустимым (защита от ручной правки json)."""
-        if self.model_size not in MODEL_CHOICES:
-            self.model_size = "medium"
-        if self.capture_mode not in CAPTURE_MODES:
-            self.capture_mode = "both"
-        if self.appearance not in ("dark", "light", "system"):
-            self.appearance = "dark"
-        try:
-            self.beam_size = int(self.beam_size)
-        except (TypeError, ValueError):
-            self.beam_size = 5
-        self.beam_size = max(1, min(10, self.beam_size))
-        if not isinstance(self.language, str) or not self.language.strip():
-            self.language = "ru"
-        return self
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Config":
-        known = {f.name for f in fields(cls)}
-        clean = {k: v for k, v in (data or {}).items() if k in known}
-        return cls(**clean).normalized()
-
-
-def load_config(path: Optional[Path] = None) -> Config:
-    """Читает настройки; при ошибке возвращает значения по умолчанию."""
-    path = Path(path) if path is not None else settings_path()
-    try:
-        raw = path.read_text(encoding="utf-8")
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            raise ValueError("в settings.json ожидался объект JSON")
-        return Config.from_dict(data)
-    except FileNotFoundError:
-        return Config().normalized()
-    except Exception as exc:  # повреждённый json — не падаем
-        logging.getLogger(__name__).warning("Не удалось прочитать настройки: %s", exc)
-        return Config().normalized()
-
-
-def save_config(cfg: Config, path: Optional[Path] = None) -> None:
-    """Сохраняет настройки (ошибки записи не должны ронять приложение)."""
-    path = Path(path) if path is not None else settings_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(cfg.normalized().to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except Exception as exc:  # noqa: BLE001
-        logging.getLogger(__name__).warning("Не удалось сохранить настройки: %s", exc)
-
-
-# --------------------------------------------------------------------------- #
 #  Журнал
 # --------------------------------------------------------------------------- #
 def setup_logging(debug: bool = False) -> logging.Logger:
-    """Настраивает запись в файл (%APPDATA%\\TutorTranscript\\app.log) и консоль."""
+    """Пишет журнал в файл (``%APPDATA%\\TutorTranscript\\app.log``) и в консоль."""
     root = logging.getLogger()
     if getattr(root, "_tutor_configured", False):
         return root
